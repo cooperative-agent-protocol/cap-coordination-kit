@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cap-coordination-kit"
+version = "0.1.0"
+description = "Protocol-logic carve of the CAP reference implementation (arbiter, handover, operational-P4 choreography, conformance monitor) for open reproduction of the paper's protocol-level results."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# Runtime dependency: the public cap.v0 Protocol Buffer bindings, available from
+# cap-spec (gen/python) or the cap-reference SDK. Provided on PYTHONPATH for now.
+dependencies = []
+
+[tool.setuptools]
+packages = ["cap_coordination_kit"]
