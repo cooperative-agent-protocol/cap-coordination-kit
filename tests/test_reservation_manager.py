@@ -1,6 +1,6 @@
-"""ReservationManager のテスト — CAP conformance Level 2 (Ch06 §6.3.3) の意味論を写経。
+"""Tests for ReservationManager — transcribing the CAP conformance Level 2 (Ch.6 §6.3.3) semantics.
 
-grant / deny(conflict) / release / 同一ホルダ idempotent / expiry を検証する。ネット不要・純ロジック。
+Verifies grant / deny(conflict) / release / same-holder idempotent / expiry. No network, pure logic.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def test_conflict_second_holder_denied():
     st2 = m.request(_req("r2", "loading", "zx200"))
     assert st2.state == _State.RESERVATION_STATE_DENIED
     assert "mst110cr" in st2.reason
-    assert m.holder_of("loading") == "mst110cr"  # 元保持者は維持
+    assert m.holder_of("loading") == "mst110cr"  # original holder is retained
 
 
 def test_release_frees_resource_for_other():
@@ -43,7 +43,7 @@ def test_release_frees_resource_for_other():
     rel = m.release(site_agent_pb2.ReservationRelease(reservation_id="r1", reason="done"))
     assert rel.state == _State.RESERVATION_STATE_RELEASED
     assert m.holder_of("loading") is None
-    # 解放後は別機が取れる
+    # after release another machine can acquire it
     assert m.request(_req("r2", "loading", "zx200")).state == _State.RESERVATION_STATE_GRANTED
     assert m.holder_of("loading") == "zx200"
 
@@ -51,7 +51,7 @@ def test_release_frees_resource_for_other():
 def test_same_holder_rerequest_is_idempotent_grant():
     m = ReservationManager()
     assert m.request(_req("r1", "loading", "mst110cr")).state == _State.RESERVATION_STATE_GRANTED
-    # 同一ホルダの再要求は GRANTED (競合扱いしない)
+    # a re-request by the same holder is GRANTED (not treated as contention)
     assert m.request(_req("r1b", "loading", "mst110cr")).state == _State.RESERVATION_STATE_GRANTED
     assert m.holder_of("loading") == "mst110cr"
 
@@ -64,10 +64,10 @@ def test_release_unknown_is_idempotent():
 
 def test_expiry_frees_resource_for_regrant():
     m = ReservationManager()
-    # window.latest = epoch 1000。now=1001 で expiry → 別機が取れる。
+    # window.latest = epoch 1000; at now=1001 it expires → another machine can acquire it.
     assert m.request(_req("r1", "loading", "mst110cr", latest_epoch=1000)).state == _State.RESERVATION_STATE_GRANTED
-    assert m.holder_of("loading", now=999.0) == "mst110cr"   # 期限前は保持
-    assert m.holder_of("loading", now=1001.0) is None        # 期限後は解放
+    assert m.holder_of("loading", now=999.0) == "mst110cr"   # held before expiry
+    assert m.holder_of("loading", now=1001.0) is None        # freed after expiry
     st2 = m.request(_req("r2", "loading", "zx200"), now=1001.0)
     assert st2.state == _State.RESERVATION_STATE_GRANTED
     assert m.holder_of("loading") == "zx200"
@@ -81,11 +81,11 @@ def test_active_lists_current_holders():
     assert active == {"loading": "mst110cr", "dig-A": "zx200"}
 
 
-# ── P2 witness: 権威トランザクションログ (arbiter 内部 emit) ───────────────────
+# ── P2 witness: the authoritative transaction log (emitted from inside the arbiter) ──
 def test_txlog_records_every_transition_with_resolved_holder():
-    """request/release が seq + resolved/prior holder 付きで記録される (P2 witness の正本)。"""
+    """request/release are recorded with seq + resolved/prior holder (the canonical P2 witness)."""
     recs: list[dict] = []
-    m = ReservationManager(on_transition=recs.append)   # sink へも流す
+    m = ReservationManager(on_transition=recs.append)   # also stream to a sink
     m.request(_req("r1", "loading", "mst110cr"))                       # GRANTED (free)
     m.request(_req("r2", "loading", "zx200"))                          # DENIED (held by peer)
     m.release(site_agent_pb2.ReservationRelease(reservation_id="r1"))  # RELEASED
@@ -97,15 +97,17 @@ def test_txlog_records_every_transition_with_resolved_holder():
         ("RELEASED", "mst110cr", "mst110cr", None),
         ("GRANTED", "zx200", None, "zx200"),
     ]
-    assert [r["seq"] for r in m.txlog()] == [1, 2, 3, 4]   # 単調 seq = 全順序
-    assert recs == m.txlog()                               # on_transition sink は同一ログを受ける
+    assert [r["seq"] for r in m.txlog()] == [1, 2, 3, 4]   # monotone seq = total order
+    assert recs == m.txlog()                               # the on_transition sink receives the same log
 
 
 def test_audit_double_grants_empty_under_contention():
-    """競合下でも arbiter は単一保持者性を守る → audit_double_grants は空 (P2 成立の正本)。
+    """Under contention the arbiter preserves single-holder exclusivity → audit_double_grants is
+    empty (the canonical record that P2 holds).
 
-    run#7 で見かけ上の double_grant が出たのは「skill 層と wire 層の 2 ログ系統を混ぜた計装
-    アーティファクト」であって、RM 内部の権威ログでは別ホルダ保持中の GRANTED は 1 件も無い。
+    An apparent double_grant was an instrumentation artifact of mixing the skill-layer and
+    wire-layer log streams; in the RM's authoritative log there is not one GRANTED while another
+    holder is active.
     """
     m = ReservationManager()
     m.request(_req("a1", "loading", "mst110cr"))   # mst holds

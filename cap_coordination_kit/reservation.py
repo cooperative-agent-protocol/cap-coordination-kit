@@ -1,17 +1,19 @@
-"""ReservationManager — 共有資源の予約権威 (Site 側)。
+"""ReservationManager — the shared-resource reservation authority (Site side).
 
-CAP の `ReservationRequest`/`ReservationRelease` を受けて `ReservationStatus` を返す。
-1 つの資源 (resource_id = ゾーン id / 積込点 / 経路区間) は同時に 1 ホルダのみ GRANTED。
-他ホルダが保持中なら DENIED (競合)。保持者の release / 窓の expiry で解放される。
+Services `ReservationRequest`/`ReservationRelease` and returns a `ReservationStatus`.
+A single resource (resource_id = zone id / load point / route segment) is GRANTED to at
+most one holder at a time; a request while another holder is active is DENIED (contention).
+A resource is freed by the holder's release or by window expiry.
 
-conformance Level 2 (Ch06 §6.3.3) の状態遷移に準拠:
-  REQUESTED → GRANTED   (資源が空き or 同一ホルダの再要求)
-  REQUESTED → DENIED    (他ホルダが保持中 = 競合)
-  GRANTED   → RELEASED  (保持者の ReservationRelease)
-  GRANTED   → EXPIRED   (granted_window.latest を過ぎた、lazy 判定)
+Implements the conformance Level 2 (Ch.6 §6.3.3) state transitions:
+  REQUESTED → GRANTED   (resource free, or same holder re-requesting)
+  REQUESTED → DENIED    (another holder is active = contention)
+  GRANTED   → RELEASED  (holder's ReservationRelease)
+  GRANTED   → EXPIRED   (past granted_window.latest, evaluated lazily)
 
-純ロジック (proto 以外に依存しない) なのでユニットテストで conformance 意味論を直接検証できる。
-時刻は呼び側が now (epoch 秒) を渡す (テスト容易性のため; 未指定なら expiry を評価しない)。
+Pure logic (no dependency beyond the generated protos), so the conformance semantics can be
+exercised directly in unit tests. The caller passes `now` (epoch seconds) for testability;
+if omitted, expiry is not evaluated.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ _State = _S.ReservationState
 
 @dataclass(frozen=True)
 class ReservationView:
-    """有効な予約の読み取り用ビュー (canvas / 問い合わせ用)。"""
+    """Read-only view of an active reservation (for canvas / queries)."""
 
     reservation_id: str
     resource_id: str
@@ -37,7 +39,7 @@ class ReservationView:
 
 
 def _ts_to_epoch(ts: Any) -> float | None:
-    """protobuf Timestamp → epoch 秒。未設定 (seconds=nanos=0) は None (=無期限)。"""
+    """protobuf Timestamp → epoch seconds. Unset (seconds=nanos=0) maps to None (= no expiry)."""
     if ts is None:
         return None
     sec = int(getattr(ts, "seconds", 0) or 0)
@@ -48,16 +50,17 @@ def _ts_to_epoch(ts: Any) -> float | None:
 
 
 class ReservationManager:
-    """共有資源の予約権威。Site servicer が所有し、機体からの要求を裁定する。"""
+    """The shared-resource reservation authority. Owned by the Site servicer; arbitrates requests from machines."""
 
     def __init__(self, on_transition: Callable[[dict[str, Any]], None] | None = None) -> None:
         self._by_id: dict[str, ReservationView] = {}       # reservation_id -> view
-        self._holder: dict[str, str] = {}                  # resource_id -> reservation_id (有効な GRANT)
-        # 権威トランザクションログ (P2 witness の正本)。各 request/release/expiry を arbiter 内部から
-        # 単調 seq + 解決済みホルダ付きで記録する。skill 層 (in-process coord.reserve) と wire 層
-        # (機体の cooperative_cycle が gRPC 越しに予約) のどちらの client からの呼び出しも、この 1 本の
-        # RM を通る = このログ 1 本で二重付与の有無を直接検証できる (skill 側の logger.info ではなく
-        # これが P2 の正本)。on_transition は site が JSONL ファイルへ流すなどの sink (任意)。
+        self._holder: dict[str, str] = {}                  # resource_id -> reservation_id (the active GRANT)
+        # Authoritative transaction log (the canonical P2 witness). Every request/release/expiry is
+        # recorded from inside the arbiter with a monotone seq and the resolved holder. Calls from
+        # either client layer -- the skill layer (in-process coord.reserve) and the wire layer (a
+        # machine's cooperative_cycle reserving over gRPC) -- pass through this single RM, so this one
+        # log lets us check for double grants directly (this, not a skill-side logger.info, is the
+        # canonical P2 record). on_transition is an optional sink (e.g. site streaming to JSONL).
         self._seq = 0
         self._txlog: list[dict[str, Any]] = []
         self._on_transition = on_transition
@@ -66,7 +69,7 @@ class ReservationManager:
         # who is waiting so a release can be routed as a typed Handover to the next waiter.
         self._pending: dict[str, list[tuple[str, str]]] = {}
 
-    # ── 内部 ────────────────────────────────────────────────────────────
+    # ── internal ───────────────────────────────────────────────────────
     def _expire_due(self, now: float | None) -> list[ReservationView]:
         if now is None:
             return []
@@ -94,11 +97,12 @@ class ReservationManager:
               requested_holder: str, prior_holder: str | None, *,
               now: float | None = None, expires_at: float | None = None,
               reason: str = "") -> None:
-        """arbiter 内部から 1 遷移を権威ログに記録する (P2 witness の正本)。
+        """Record one transition to the authoritative log from inside the arbiter (the P2 witness).
 
-        resolved_holder = 遷移**後**に RM が実際に保持者として記録しているホルダ。RM は資源あたり
-        高々 1 ホルダしか持てない (request が別ホルダ保持中を DENIED するため) ので、このフィールドが
-        単一保持者性の正本になる。prior_holder = 遷移**前**の保持者 (二重付与監査に使う)。
+        resolved_holder = the holder the RM actually records *after* the transition. Since the RM
+        holds at most one holder per resource (a request against an active holder is DENIED), this
+        field is the canonical record of single-holder exclusivity. prior_holder = the holder
+        *before* the transition (used by the double-grant audit).
         """
         self._seq += 1
         cur = self._holder.get(resource_id)
@@ -116,10 +120,10 @@ class ReservationManager:
             except Exception:  # noqa: BLE001 - witness logging must never break arbitration
                 pass
 
-    # ── 公開 API ────────────────────────────────────────────────────────
+    # ── public API ─────────────────────────────────────────────────────
     def request(self, req: site_agent_pb2.ReservationRequest, *,
                 now: float | None = None) -> events_pb2.ReservationStatus:
-        """予約要求を裁定する。空き/同一ホルダ → GRANTED、他ホルダ保持中 → DENIED。"""
+        """Arbitrate a reservation request. Free / same holder → GRANTED; another holder active → DENIED."""
         self._expire_due(now)
         rid, resource_id, holder_id = req.reservation_id, req.resource_id, req.holder_id
         cur = self._holder.get(resource_id)
@@ -140,11 +144,11 @@ class ReservationManager:
                 rid, resource_id, holder_id, _State.RESERVATION_STATE_DENIED,
                 reason=f"resource '{resource_id}' held by '{prior_holder}'",
             )
-        # 空き or 同一ホルダの再要求 (idempotent) → GRANTED
+        # free, or same holder re-requesting (idempotent) → GRANTED
         view = ReservationView(reservation_id=rid, resource_id=resource_id, holder_id=holder_id,
                                expires_at=_ts_to_epoch(req.requested_window.latest)
                                if req.HasField("requested_window") else None)
-        # 同一ホルダが別 reservation_id で再要求した場合は旧 grant を畳む
+        # if the same holder re-requests under a different reservation_id, fold the old grant
         if cur is not None and cur != rid:
             self._by_id.pop(cur, None)
         self._by_id[rid] = view
@@ -157,7 +161,7 @@ class ReservationManager:
 
     def release(self, rel: site_agent_pb2.ReservationRelease, *,
                 now: float | None = None) -> events_pb2.ReservationStatus:
-        """予約を解放する。未知 id でも RELEASED を返す (idempotent)。"""
+        """Release a reservation. Returns RELEASED even for an unknown id (idempotent)."""
         v = self._by_id.pop(rel.reservation_id, None)
         if v is None:
             self._emit("RELEASED", "", rel.reservation_id, "", None, now=now,
@@ -174,16 +178,20 @@ class ReservationManager:
     def transfer_grant(self, resource_id: str, receiver_id: str, receiver_reservation_id: str, *,
                        now: float | None = None, expires_at: float | None = None,
                        ) -> events_pb2.ReservationStatus | None:
-        """機体間 Handover の権威 1 ステップ (TLA `BeginHandoverAtomic` の資源効果に対応)。
+        """The authoritative single step of a machine-to-machine Handover (the resource effect of
+        TLA `BeginHandoverAtomic`).
 
-        resource_id の保持者を現保持者 (sender) から receiver_id へ **単一ステップ**で付け替える:
-        ``self._holder[resource_id]`` は old_rid から new_rid へ直接遷移し、途中で未設定 (free window)
-        にも二重保持にもならない。これが atomic ownership transfer と naive release-then-reacquire を
-        分ける唯一の点。権威ログには ``HANDOVER`` 遷移として記録する (prior_holder=sender,
-        resolved_holder=receiver)。``audit_double_grants`` は ``GRANTED`` のみ走査するので、この正当な
-        授受は誤検出されない (free-window/二重保持の検証は `audit_handover` が別途行う)。
+        Re-points the holder of resource_id from the current holder (sender) to receiver_id in a
+        **single step**: ``self._holder[resource_id]`` moves directly from old_rid to new_rid,
+        never passing through unset (a free window) or a double hold. This is the sole point that
+        separates an atomic ownership transfer from a naive release-then-reacquire. It is recorded
+        on the authoritative log as a ``HANDOVER`` transition (prior_holder=sender,
+        resolved_holder=receiver). ``audit_double_grants`` scans only ``GRANTED`` transitions, so
+        this legitimate transfer is not flagged (free-window / double-hold checking is done
+        separately by `audit_handover`).
 
-        資源が誰にも保持されていなければ None を返す (呼び側は begin_atomic の前提を満たすこと)。
+        Returns None if the resource is held by no one (the caller must satisfy begin_atomic's
+        precondition).
         """
         self._expire_due(now)
         cur = self._holder.get(resource_id)
@@ -192,8 +200,8 @@ class ReservationManager:
             return None
         view = ReservationView(reservation_id=receiver_reservation_id, resource_id=resource_id,
                                holder_id=receiver_id, expires_at=expires_at)
-        # 単一ステップの付け替え: receiver を保持者にし、sender の grant を同じ操作で畳む。
-        # この 2 代入の間に _holder[resource_id] が消える瞬間はない (= no free window)。
+        # Single-step re-point: make receiver the holder and fold the sender's grant in the same
+        # operation. _holder[resource_id] never goes empty between these two assignments (= no free window).
         self._by_id[receiver_reservation_id] = view
         self._holder[resource_id] = receiver_reservation_id
         if cur is not None and cur != receiver_reservation_id:
@@ -205,20 +213,20 @@ class ReservationManager:
                             _State.RESERVATION_STATE_GRANTED)
 
     def holder_of(self, resource_id: str, *, now: float | None = None) -> str | None:
-        """資源の現在の保持者 holder_id (無ければ None)。"""
+        """The resource's current holder holder_id (None if unheld)."""
         self._expire_due(now)
         rid = self._holder.get(resource_id)
         v = self._by_id.get(rid) if rid else None
         return v.holder_id if v else None
 
     def reservation_id_of(self, resource_id: str, *, now: float | None = None) -> str | None:
-        """資源の現在の保持予約 reservation_id (無ければ None)。naive handover が保持者の grant を
-        資源単位で解放する (release は reservation_id を要求するため) のに使う。"""
+        """The resource's current holding reservation_id (None if unheld). Used by naive handover
+        to release the holder's grant by resource (since release requires a reservation_id)."""
         self._expire_due(now)
         return self._holder.get(resource_id)
 
     def _clear_pending(self, resource_id: str, holder_id: str) -> None:
-        """holder_id を resource_id の待機キューから外す (grant/handover 完了時)。"""
+        """Remove holder_id from resource_id's waiting queue (on grant/handover completion)."""
         q = self._pending.get(resource_id)
         if q:
             q[:] = [(h, r) for (h, r) in q if h != holder_id]
@@ -226,30 +234,31 @@ class ReservationManager:
                 self._pending.pop(resource_id, None)
 
     def pending_for(self, resource_id: str, *, exclude: str | None = None) -> list[tuple[str, str]]:
-        """resource_id を DENIED-while-held で待っている (holder_id, reservation_id) の FIFO。
-        現保持者 (= exclude) は除く。coordinator が release を次の待機者への typed Handover に
-        ルーティングする (R3) ために使う。"""
+        """FIFO of (holder_id, reservation_id) waiting on resource_id while DENIED-while-held,
+        excluding the current holder (= exclude). Used by the coordinator to route a release as a
+        typed Handover to the next waiter (R3)."""
         cur = self.holder_of(resource_id)
         return [(h, r) for (h, r) in self._pending.get(resource_id, [])
                 if h != cur and h != exclude]
 
     def active(self, *, now: float | None = None) -> list[ReservationView]:
-        """有効な (GRANTED かつ未 expiry) 予約の一覧 (canvas/問い合わせ用)。"""
+        """List of active (GRANTED and not yet expired) reservations (for canvas / queries)."""
         self._expire_due(now)
         return [self._by_id[rid] for rid in self._holder.values() if rid in self._by_id]
 
-    # ── P2 witness 監査 (権威トランザクションログからの直接検証) ───────────────
+    # ── P2 witness audit (direct verification from the authoritative transaction log) ──
     def txlog(self) -> list[dict[str, Any]]:
-        """権威トランザクションログ (P2 witness の正本) のコピー。"""
+        """A copy of the authoritative transaction log (the canonical P2 witness)."""
         return list(self._txlog)
 
     def audit_double_grants(self) -> list[dict[str, Any]]:
-        """二重付与 (P2 違反) の検出 — 別ホルダ保持中に GRANTED された遷移を返す。
+        """Detect double grants (P2 violations) — returns transitions that were GRANTED while
+        another holder was active.
 
-        正しい arbiter では常に空 (request が別ホルダ保持中を必ず DENIED するため)。skill 層と
-        wire 層のどちらの client からの予約も 1 本の RM を通るので、このログ 1 本で P2 を検証できる
-        (= run#7 の見かけの二重付与が「2 ログ系統を混ぜた計装アーティファクト」だった件を、正本側で
-        確定的に否定できる)。
+        Always empty for a correct arbiter (a request against an active holder is always DENIED).
+        Reservations from both the skill and wire client layers pass through the single RM, so this
+        one log suffices to verify P2 (it lets the canonical side definitively rule out an apparent
+        double grant that was in fact an instrumentation artifact of mixing two log streams).
         """
         return [r for r in self._txlog
                 if r["event"] == "GRANTED" and r["prior_holder"] not in (None, r["requested_holder"])]

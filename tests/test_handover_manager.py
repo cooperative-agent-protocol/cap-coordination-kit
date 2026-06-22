@@ -1,7 +1,9 @@
-"""HandoverManager のテスト — 機体間 Handover サブプロトコル (Ch06 §6.4) の実行時駆動を写経。
+"""Tests for HandoverManager — transcribing the runtime drive of the machine-to-machine Handover
+sub-protocol (Ch.6 §6.4).
 
-CAPCoordination.tla の Handover actions に 1:1 対応する遷移と、P4 (HandoverReceiverOwnership):
-IN_PROGRESS 中つねに holder=receiver、を atomic / naive の対比で検証する。ネット不要・純ロジック。
+Verifies the transitions in 1:1 correspondence with the Handover actions of CAPCoordination.tla,
+and P4 (HandoverReceiverOwnership): holder=receiver throughout IN_PROGRESS, contrasting atomic vs
+naive. No network, pure logic.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ def _req(reservation_id: str, resource_id: str, holder_id: str):
 
 
 def _setup_contended(rm: ReservationManager, resource="load:p1", sender="zx200", receiver="mst110cr"):
-    """sender が resource を保持し、receiver は要求して DENIED (待機/キュー) の状態を作る。"""
+    """Set up the state where sender holds resource and receiver requests it and is DENIED (queued/waiting)."""
     rm.request(_req(f"{sender}-r", resource, sender), now=1.0)
     st = rm.request(_req(f"{receiver}-q", resource, receiver), now=2.0)
     assert st.state == _State.RESERVATION_STATE_DENIED       # receiver queued behind the sender
@@ -28,8 +30,8 @@ def _setup_contended(rm: ReservationManager, resource="load:p1", sender="zx200",
 
 
 def _ownership_held_through_in_progress(ho: HandoverManager) -> bool:
-    """P4 witness: IN_PROGRESS に入った瞬間 (BEGIN) に holder=receiver だったか。
-    atomic なら True (単一ステップ授受)、naive なら False (free window で holder=NONE)。"""
+    """P4 witness: at the instant IN_PROGRESS opens (BEGIN), was holder=receiver?
+    True for atomic (single-step transfer); False for naive (free window with holder=NONE)."""
     for rec in ho.log():
         if rec["action"] == "BEGIN":
             return rec["holder_after"] == rec["receiver"]
