@@ -16,6 +16,7 @@ simulator) stays closed.
 | `handover.py` | `HandoverManager` — runtime driver for the typed Handover sub-protocol (initiate → ack → begin{atomic} → complete → cleanup). |
 | `handover_choreography.py` | Deterministic **operational-P4** model: enumerates handover interleavings and reports load-point co-occupancy under an atomic typed handover vs. a plain release-then-reacquire mutex. |
 | `sensitivity_surface.py` | Extends the operational-P4 model into a **sensitivity surface** over vacate latency x receiver delay, locating the boundary where a plain lock co-occupies the load point (20 of 30 cells) while CAP never does (occupancy 1 in every cell). |
+| `lease_lock.py` | A realistic **lease+TTL lock** (Chubby/ZooKeeper-style) baseline and a deterministic experiment: it reclaims and re-grants a **live holder's** lock when the lease outlasts the hold (a "lease steal", 15 of 25 cells) while CAP's deny-on-busy arbiter never does (0); the steal is invisible to the no-double-grant audit, motivating CAP's grant-epoch fence. |
 | `refinement_monitor.py` | Runtime spec↔implementation **conformance monitor**: reconstructs holder state from an arbiter transaction log alone and checks every transition against the spec's allowed transition relation (no double-grant, no spurious denial, handover only by the current holder). |
 
 The only external dependency is the public **cap.v0** Protocol Buffer bindings
@@ -37,10 +38,14 @@ python3 -m cap_coordination_kit.handover_choreography
 python3 -m cap_coordination_kit.sensitivity_surface
 #   mutex co-occupies 20/30 cells (occupancy 2 = violation); CAP co-occupies 0/30
 
-# 4. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface)
-python3 -m pytest tests/ -q          # 24 passed
+# 4. Lease-lock baseline (paper Table: lease steals a live holder's lock 15/25 vs CAP 0) — bit-exact
+python3 -m cap_coordination_kit.lease_lock
+#   lease steals total=15/25 cells; CAP deny-on-busy steals=0; audit flags=0
 
-# 5. Re-derive the per-transition conformance verdict from a shipped campaign log
+# 5. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
+python3 -m pytest tests/ -q          # 26 passed
+
+# 6. Re-derive the per-transition conformance verdict from a shipped campaign log
 python3 -m cap_coordination_kit.refinement_monitor <path>/reservation_txlog.jsonl
 ```
 
@@ -52,8 +57,9 @@ reference implementation.
 ## Scope
 
 This kit makes the **operational-P4 choreography**, its **sensitivity surface**,
-and the **per-transition conformance verdict** publicly reproducible, and lets
-the **arbiter and handover invariants** be unit-tested directly. It does **not** regenerate the contended
+the **lease-lock baseline**, and the **per-transition conformance verdict**
+publicly reproducible, and lets the **arbiter and handover invariants** be
+unit-tested directly. It does **not** regenerate the contended
 fault-injection / handover campaigns or the physics witness — those run inside
 the closed reference implementation and are made *auditable* (published
 transition logs + per-run records), not re-runnable. See the paper's Data &
