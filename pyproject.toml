@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cap-coordination-kit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Protocol-logic carve of the CAP reference implementation (arbiter, handover, operational-P4 choreography, conformance monitor) for open reproduction of the paper's protocol-level results."
 readme = "README.md"
 requires-python = ">=3.10"

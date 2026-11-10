@@ -18,6 +18,10 @@ simulator) stays closed.
 | `sensitivity_surface.py` | Extends the operational-P4 model into a **sensitivity surface** over vacate latency x receiver delay, locating the boundary where a plain lock co-occupies the load point (20 of 30 cells) while CAP never does (occupancy 1 in every cell). |
 | `lease_lock.py` | A realistic **lease+TTL lock** (Chubby/ZooKeeper-style) baseline and a deterministic experiment: it reclaims and re-grants a **live holder's** lock when the lease outlasts the hold (a "lease steal", 15 of 25 cells) while CAP's deny-on-busy arbiter never does (0); the steal is invisible to the no-double-grant audit, motivating CAP's grant-epoch fence. |
 | `refinement_monitor.py` | Runtime spec↔implementation **conformance monitor**: reconstructs holder state from an arbiter transaction log alone and checks every transition against the spec's allowed transition relation (no double-grant, no spurious denial, handover only by the current holder). |
+| `occupancy.py` | The **occupancy-gated arbiter** of the revised paper and the family of schemes it runs: mutex released on completion, mutex group released on exit, renewable fenced lease, the lease with a vacancy check, and the proposed protocol (`Scheme.named`). Entry permits timed by the lease rule, custody until a confirmed vacancy (`VacancyEnvelope`), a journal with a restart guard. |
+| `entry_gate.py` | The machine-side **entry gate**: checks every drive command against the path to a stop under a model of the drive (command delay, acceleration limit, check period), slows or stops a machine that has no authority to enter a zone, stops a command that is not renewed, and lets a machine without authority inside a zone move out only. |
+| `occupancy_conformance.py` | Replays a trial's records (arbiter log, gate logs, true positions) against the rules of the occupancy model (`cap-spec/formal/tla/OccupancyHandover.tla`), independently of the arbiter's code. |
+| `scheme_trial.py` | A small deterministic simulation - two scripted carriers as unicycles, one loading bay - that runs the five schemes through five scenarios and reports which ones let two carriers into the bay at once. Public code only; reproducible bit for bit. |
 
 The only external dependency is the public **cap.v0** Protocol Buffer bindings
 (from [`cap-spec`](https://github.com/cooperative-agent-protocol/cap-spec) /
@@ -42,10 +46,23 @@ python3 -m cap_coordination_kit.sensitivity_surface
 python3 -m cap_coordination_kit.lease_lock
 #   lease steals total=15/25 cells; CAP deny-on-busy steals=0; audit flags=0
 
-# 5. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 26 passed
+# 5. The five schemes, five scenarios (revised paper: which scheme is safe where) - bit-exact
+python3 -m cap_coordination_kit.scheme_trial
+#   scenario                mutex_on_done          mutex_group         lease_fenced  lease_fenced_vacate                  cap
+#   nominal                safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)
+#   release_early         S1+S2 (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
+#   holder_silent          safe (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
+#   reenter_old            safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)
+#   restart_lossy         S1+S2 (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
+#   25 trials; records conform to the model in 25; 4888 arbiter transitions, 202 gate steps
+#   (S1: two carriers inside the bay at once; S2: a carrier inside that the arbiter does not account for.
+#    One deterministic run per cell: "safe" here is one execution, not a proof - the exhaustive answer for each
+#    scheme is the model checker's, in cap-spec/formal/tla/family.)
 
-# 6. Re-derive the per-transition conformance verdict from a shipped campaign log
+# 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
+python3 -m pytest tests/ -q          # 42 passed
+
+# 7. Re-derive the per-transition conformance verdict from a shipped campaign log
 python3 -m cap_coordination_kit.refinement_monitor <path>/reservation_txlog.jsonl
 ```
 
