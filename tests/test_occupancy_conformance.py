@@ -158,3 +158,16 @@ def test_an_authorisation_before_the_other_gates_know_the_zone_is_caught():
     refused = dict(rec(1, 0.0, "DENIED", "a"), reason="the zone table is not yet acknowledged by 'b'")
     r = run([table, *known, refused], gate_logs={})
     assert r.conforming and not r.unasked_refusals
+
+
+def test_a_zone_moved_while_it_is_held_is_caught():
+    table = dict(rec(0, -3.0, "TABLE", None, epoch=1), reason="zone at (0.00, 0.00) radius 9.00 m; open to zx200")
+    known = [dict(rec(0, -2.0, "MACHINE", m, rid=""), reason="known to the Site") for m in ("a", "b", "zx200")]
+    acks = [dict(rec(0, -1.0, "TABLE_ACK", m, rid="", epoch=1)) for m in ("a", "b")]
+    grant = rec(1, 0.0, "GRANTED", "a", holder="a", epoch=1)
+    moved = dict(rec(2, 0.5, "TABLE", None, epoch=2), reason="zone at (0.01, 0.00) radius 9.00 m; open to zx200")
+    r = run([table, *known, *acks, grant, moved], gate_logs={})
+    assert not r.conforming and any("the zone was moved" in v["reason"] for v in r.violations), r.violations
+    free = run([table, *known, *acks, moved], gate_logs={})          # nobody holds it: a zone may move
+    assert free.conforming, free.violations
+

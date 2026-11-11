@@ -133,6 +133,11 @@ class Scheme:
 
 
 # ---------------------------------------------------------------------------- geometry
+# A zone registered again within this distance of where it stands (centre and radius) is the same zone [m]: far
+# below the envelope's position bound, far above the jitter of a standing machine's reported pose.
+ZONE_SAME_M = 0.10
+
+
 @dataclass(frozen=True)
 class Zone:
     """A conflict zone: the loading bay around a loader. Machines in ``compatible`` (the loader itself) may be in it
@@ -266,6 +271,7 @@ class OccupancyArbiter(ReservationManager):
         self.boot = int(boot_id if boot_id is not None else secrets.randbits(32)) & 0xFFFFFFFF
         self._r: dict[str, _Res] = {}
         self.zones: dict[str, Zone] = {}
+        self._zone_refused: dict[str, tuple] = {}       # the last move of a zone that was refused (logged once)
         # what the vacancy check sees of the reported poses (None: the poses as reported). A trial's fault hook: the
         # position error A2 bounds is injected here, on the arbiter's view alone.
         self.observe_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -374,8 +380,26 @@ class OccupancyArbiter(ReservationManager):
 
     # ------------------------------------------------------------------ API: zones, plan
     def set_zone(self, zone: Zone) -> None:
-        if self.zones.get(zone.resource_id) == zone:
-            return
+        """Register a zone, or move one. A registration within ``ZONE_SAME_M`` of the registered zone is that zone
+        (a loader's reported pose differs by centimetres from one report to the next, and each difference would
+        otherwise be a new table for every gate to acknowledge). A zone is not moved while a machine holds it, is
+        in custody of it or has a permit for it that may be in use: the registered zone stands, and the move is
+        refused (the model assumes a zone that stays where it is while an authorisation for it is out)."""
+        old = self.zones.get(zone.resource_id)
+        if old is not None:
+            if (old.compatible == zone.compatible and old.distance(zone.x, zone.y) <= ZONE_SAME_M
+                    and abs(old.radius_m - zone.radius_m) <= ZONE_SAME_M):
+                return
+            r = self._res(zone.resource_id)
+            if r.holder is not None or r.custody or r.live:
+                key = (round(zone.x, 1), round(zone.y, 1), round(zone.radius_m, 1), zone.compatible)
+                if self._zone_refused.get(zone.resource_id) != key:      # said once for each place asked for
+                    self._zone_refused[zone.resource_id] = key
+                    logger.warning("[occupancy] %s is not moved to (%.2f, %.2f) radius %.2f m while it is held, in "
+                                   "custody or under a permit: it stays at (%.2f, %.2f)", zone.resource_id, zone.x,
+                                   zone.y, zone.radius_m, old.x, old.y)
+                return
+        self._zone_refused.pop(zone.resource_id, None)
         self.zones[zone.resource_id] = zone
         self.table_version += 1
         self._zone_since[zone.resource_id] = self.table_version

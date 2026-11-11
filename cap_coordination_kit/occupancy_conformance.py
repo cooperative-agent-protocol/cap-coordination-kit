@@ -21,7 +21,9 @@ was enabled in that state, applies the model's effect, and compares the result w
     RESTORED, GUARD_*      ArbRestart ...   the state taken up equals the state before the restart; the guard's steps
     TABLE, MACHINE,        (zone table)     no GRANTED or PERMIT for a zone while a machine the arbiter knows, and the
     TABLE_ACK                               zone is closed to, has not acknowledged a table holding the zone as it
-                                            stands (the model takes the gates' knowledge of the zone for granted)
+                                            stands (the model takes the gates' knowledge of the zone for granted);
+                                            no TABLE that moves a zone while it is held, in custody or under a permit
+                                            (the model takes a zone to stay where it is meanwhile)
 
     gate log               model action     enabled when
     admit / enter m        Enter(m)         gate "local": a grant to m that m has not given up; gate "permit": a
@@ -135,6 +137,7 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
     acked: dict[str, int] = {}
     zone_since: dict[str, int] = {}
     zone_open_to: dict[str, set[str]] = {}
+    zone_geometry: dict[str, str] = {}        # where each zone stands, as the arbiter logged it
 
     def table_late(rid: str, m: str | None) -> list[str]:
         if rid not in zone_since or scheme.gate == "none":
@@ -148,6 +151,13 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
         res.transitions += 1
         res.event_counts[ev] = res.event_counts.get(ev, 0) + 1
         if ev == "TABLE":
+            geometry = (rec.get("reason") or "").partition(";")[0]
+            zs = state.get(rid)
+            if (rid in zone_geometry and zone_geometry[rid] != geometry and int(rec.get("epoch") or 0) > 0
+                    and zs is not None and (zs.holder is not None or zs.custody or any(p[2] > t for p in zs.live))):
+                bad(res.violations, rec, f"the zone was moved ({zone_geometry[rid]} -> {geometry}) while it was held, "
+                                         "in custody or under a permit")
+            zone_geometry[rid] = geometry
             zone_since[rid] = int(rec.get("epoch") or 0)
             opened = (rec.get("reason") or "").rpartition("open to ")[2].strip()
             zone_open_to[rid] = set() if opened in ("", "-") else set(opened.split(","))
