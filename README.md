@@ -22,6 +22,7 @@ simulator) stays closed.
 | `entry_gate.py` | The machine-side **entry gate**: checks every drive command against the path to a stop under a model of the drive (command delay, acceleration limit, check period), slows or stops a machine that has no authority to enter a zone, stops a command that is not renewed, and lets a machine without authority inside a zone move out only. |
 | `occupancy_conformance.py` | Replays a trial's records (arbiter log, gate logs, true positions) against the rules of the occupancy model (`cap-spec/formal/tla/OccupancyHandover.tla`), independently of the arbiter's code. |
 | `scheme_trial.py` | A small deterministic simulation - two scripted carriers as unicycles, one loading bay - that runs the five schemes through five scenarios and reports which ones let two carriers into the bay at once. Public code only; reproducible bit for bit. |
+| `vacancy_margin.py` | The probability of a **false vacancy confirmation** from the margin of the vacancy check and the spread of the position error (a Marcum Q-function), per report and over a custody episode; the margins that are necessary and sufficient when the error is bounded. No dependency. |
 
 The only external dependency is the public **cap.v0** Protocol Buffer bindings
 (from [`cap-spec`](https://github.com/cooperative-agent-protocol/cap-spec) /
@@ -60,7 +61,12 @@ python3 -m cap_coordination_kit.scheme_trial
 #    scheme is the model checker's, in cap-spec/formal/tla/family.)
 
 # 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 42 passed
+python3 -m pytest tests/ -q          # 48 passed
+
+# 6b. The risk of a false vacancy confirmation for a margin and an error spread (revised paper, Theorem 4)
+python3 -m cap_coordination_kit.vacancy_margin --radius 9 --margin 2.225 --sigma 0.5 1.5
+#   sigma 0.50 m, 0.50 m inside: 2.91e-08 per report / 0.000 over 20 reports
+#   sigma 1.50 m, 0.50 m inside: 4.09e-02 per report / 0.567 over 20 reports
 
 # 7. Re-derive the per-transition conformance verdict from a shipped campaign log
 python3 -m cap_coordination_kit.refinement_monitor <path>/reservation_txlog.jsonl
