@@ -55,13 +55,13 @@ python3 -m cap_coordination_kit.scheme_trial
 #   holder_silent          safe (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
 #   reenter_old            safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)
 #   restart_lossy         S1+S2 (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
-#   25 trials; records conform to the model in 25; 4888 arbiter transitions, 202 gate steps
+#   25 trials; records conform to the model in 25; 4918 arbiter transitions, 202 gate steps
 #   (S1: two carriers inside the bay at once; S2: a carrier inside that the arbiter does not account for.
 #    One deterministic run per cell: "safe" here is one execution, not a proof - the exhaustive answer for each
 #    scheme is the model checker's, in cap-spec/formal/tla/family.)
 
 # 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 48 passed
+python3 -m pytest tests/ -q          # 49 passed
 
 # 6b. The risk of a false vacancy confirmation for a margin and an error spread (revised paper, Theorem 4)
 python3 -m cap_coordination_kit.vacancy_margin --radius 9 --margin 2.225 --sigma 0.5 1.5

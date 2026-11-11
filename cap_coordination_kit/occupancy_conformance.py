@@ -19,6 +19,9 @@ was enabled in that state, applies the model's effect, and compares the result w
     DENIED / PERMIT_DENIED (no step)        the corresponding step was not enabled (else: a refusal the model does
                                             not ask for - reported apart, it is not a safety matter)
     RESTORED, GUARD_*      ArbRestart ...   the state taken up equals the state before the restart; the guard's steps
+    TABLE, MACHINE,        (zone table)     no GRANTED or PERMIT for a zone while a machine the arbiter knows, and the
+    TABLE_ACK                               zone is closed to, has not acknowledged a table holding the zone as it
+                                            stands (the model takes the gates' knowledge of the zone for granted)
 
     gate log               model action     enabled when
     admit / enter m        Enter(m)         gate "local": a grant to m that m has not given up; gate "permit": a
@@ -126,13 +129,47 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
             return None
         return math.hypot(near[1] - zx, near[2] - zy) < zr
 
+    # the zone table: which machines the arbiter knows, which table each one's gate enforces, since which version
+    # each zone stands as it is and to whom it is open - a restart of either kind begins a new table
+    known: set[str] = set()
+    acked: dict[str, int] = {}
+    zone_since: dict[str, int] = {}
+    zone_open_to: dict[str, set[str]] = {}
+
+    def table_late(rid: str, m: str | None) -> list[str]:
+        if rid not in zone_since or scheme.gate == "none":
+            return []
+        return sorted(k for k in known if k != m and k not in zone_open_to.get(rid, set())
+                      and acked.get(k, -1) < zone_since[rid])
+
     for rec in tx:
         ev, rid, m = rec.get("event"), rec.get("resource_id") or "", rec.get("requested_holder")
         t = float(rec.get("t_mono") or 0.0)
         res.transitions += 1
         res.event_counts[ev] = res.event_counts.get(ev, 0) + 1
+        if ev == "TABLE":
+            zone_since[rid] = int(rec.get("epoch") or 0)
+            opened = (rec.get("reason") or "").rpartition("open to ")[2].strip()
+            zone_open_to[rid] = set() if opened in ("", "-") else set(opened.split(","))
+            continue
+        if ev == "MACHINE":
+            known.add(m)
+            continue
+        if ev == "TABLE_ACK":
+            if int(rec.get("epoch") or 0) > max(zone_since.values(), default=0):
+                bad(res.violations, rec, "an acknowledgement of a table that was never issued")
+            if int(rec.get("epoch") or 0) < 0:
+                acked.pop(m, None)                    # its gate no longer holds this start's table
+            else:
+                acked[m] = int(rec.get("epoch") or 0)
+            continue
         if not rid:
             # steps of the whole arbiter
+            if ev == "RESTORED" or (ev and ev.startswith("GUARD_") and "journal" in (rec.get("reason") or "")
+                                    and "restart" in (rec.get("reason") or "")):
+                known.clear()
+                acked.clear()
+                zone_since.clear()
             if ev == "RESTORED":
                 res.restarts += 1                 # the journal taken up: the state must be the one before
                 guard = "open"
@@ -165,6 +202,8 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
                     bad(res.violations, rec, f"granted while {inc_c} not confirmed out")
                 if inc_l:
                     bad(res.violations, rec, f"granted while a permit of {inc_l} is counted")
+                if table_late(rid, m):
+                    bad(res.violations, rec, f"granted before the gates of {table_late(rid, m)} know the zone")
                 if scheme.succession == "designated" and planned_before not in (None, m):
                     bad(res.violations, rec, f"granted past the planned successor {planned_before}")
                 if scheme.arb == "queue" and planned_before not in (None, m):
@@ -195,6 +234,8 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
                 bad(res.violations, rec, f"a permit while {inc_c} not confirmed out")
             if inc_l:
                 bad(res.violations, rec, f"a permit while a permit of {inc_l} is counted")
+            if table_late(rid, m):
+                bad(res.violations, rec, f"a permit before the gates of {table_late(rid, m)} know the zone")
             z.live.append((m, int(rec.get("epoch") or 0), t + life))
         elif ev == "RELEASED":
             holder = rec.get("prior_holder")
@@ -224,13 +265,14 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
             if scheme.arb != "none":
                 inc_c, inc_l = others(z, m, t)
                 free = (guard == "open" and z.holder is None and not inc_c and not inc_l
+                        and not table_late(rid, m)
                         and planned_before in (None, m) and (rec.get("planned") in (None, m)))
                 if free and "journal" not in (rec.get("reason") or ""):
                     bad(res.unasked_refusals, rec, "denied although the grant was enabled")
         elif ev == "PERMIT_DENIED":
             inc_c, inc_l = others(z, m, t)
             if scheme.gate == "permit" and guard == "open" and z.holder == m and not inc_c and not inc_l \
-                    and "journal" not in (rec.get("reason") or ""):
+                    and not table_late(rid, m) and "journal" not in (rec.get("reason") or ""):
                 bad(res.unasked_refusals, rec, "permit refused although it was enabled")
         elif ev == "HANDOVER_REFUSED":
             pass

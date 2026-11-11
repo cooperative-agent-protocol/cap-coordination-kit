@@ -57,6 +57,11 @@ _S = events_pb2.ReservationStatus
 _State = _S.ReservationState
 
 PERMIT_REASON = "entry_permit"          # a ReservationRequest with this reason asks for an entry permit
+# The zone table on the wire. Site -> machine: a ReservationStatus with no resource whose reason is this prefix plus
+# JSON {"boot", "version", "zones"}. Machine -> Site: the table its gate enforces, "<boot>:<version>", under this key
+# of the Heartbeat's health list (a state, repeated with every heartbeat, so a lost one is made up by the next).
+ZONE_TABLE_REASON = "cap.zone-table:"
+ZONE_TABLE_HEALTH_KEY = "cap.zone_table"
 JOURNAL_V2_NAME = "occupancy_journal.jsonl"
 
 
@@ -264,6 +269,14 @@ class OccupancyArbiter(ReservationManager):
         # what the vacancy check sees of the reported poses (None: the poses as reported). A trial's fault hook: the
         # position error A2 bounds is injected here, on the arbiter's view alone.
         self.observe_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        # The zone table: its version rises whenever a zone is added or changed. A gate knows a zone only once it has
+        # received a table that holds it, so no machine is authorised for a zone before every known machine that the
+        # zone is closed to has acknowledged such a table (``_blocked_for``). ``_known``: machines the Site has heard
+        # from in this start; a machine it has never heard from has no table, and its gate does not let it move.
+        self.table_version = 0
+        self._zone_since: dict[str, int] = {}
+        self._known: set[str] = set()
+        self._acked: dict[str, int] = {}
         self.guard = "open"                       # "open" | "waitTime" | "waitVacancy"
         self._guard_since = self._clock()
         self.denied_by_journal = 0
@@ -301,6 +314,9 @@ class OccupancyArbiter(ReservationManager):
         r = self._res(resource_id)
         if self.guard != "open":
             return f"bay closed after a restart ({self.guard})"
+        late = self.table_unacknowledged(resource_id, exclude=m)
+        if late:
+            return f"the zone table is not yet acknowledged by {', '.join(repr(k) for k in late)}"
         for c in r.custody:
             if self._incompatible(resource_id, m, c):
                 return f"'{c}' not yet confirmed out"
@@ -311,6 +327,7 @@ class OccupancyArbiter(ReservationManager):
 
     def _snapshot(self) -> dict[str, Any]:
         return {"v": 2, "boot": self.boot, "t_wall": time.time(), "scheme": self.scheme.name or asdict(self.scheme),
+                "zones": json.loads(zones_to_param(self.zones.values())),
                 "res": {k: {"holder": r.holder, "rid": r.rid, "gen": r.gen, "custody": sorted(r.custody),
                             "live": [[h, e] for (h, e) in r.live]} for k, r in self._r.items()}}
 
@@ -357,7 +374,66 @@ class OccupancyArbiter(ReservationManager):
 
     # ------------------------------------------------------------------ API: zones, plan
     def set_zone(self, zone: Zone) -> None:
+        if self.zones.get(zone.resource_id) == zone:
+            return
         self.zones[zone.resource_id] = zone
+        self.table_version += 1
+        self._zone_since[zone.resource_id] = self.table_version
+        self._log_zone(zone, self.table_version)
+        try:
+            self._persist()              # the zones are part of what a restart with the journal takes up again
+        except JournalUnavailable:
+            logger.error("[occupancy] the journal cannot be written: the zone table is not recorded")
+
+    def _log_zone(self, zone: Zone, version: int) -> None:
+        self._log("TABLE", zone.resource_id, "", None, None, epoch=version,
+                  reason=f"zone at ({zone.x:.2f}, {zone.y:.2f}) radius {zone.radius_m:.2f} m; open to "
+                         f"{','.join(sorted(zone.compatible)) or '-'}")
+
+    @property
+    def table_withheld(self) -> bool:
+        """After a restart that lost the journal the table of this start may be empty while a permit of the start
+        before is still good, and a gate that took it would let its machine into a zone it no longer lists: no
+        table goes out until that wait is over (a gate without a table lets nothing move)."""
+        return self.guard == "waitTime"
+
+    def note_machine(self, machine_id: str) -> None:
+        """The Site has heard from this machine: from now on it must acknowledge the zone table before another
+        machine is authorised for a zone that is closed to it."""
+        if machine_id and machine_id not in self._known:
+            self._known.add(machine_id)
+            self._log("MACHINE", "", "", machine_id, None, reason="known to the Site")
+
+    def zone_table(self) -> dict[str, Any]:
+        return {"boot": self.boot, "version": self.table_version, "zones": json.loads(zones_to_param(self.zones.values()))}
+
+    def table_acked_by(self, machine_id: str) -> bool:
+        return self._acked.get(machine_id) == self.table_version
+
+    def acknowledge_table(self, machine_id: str, boot: int | None, version: int | None) -> None:
+        """What the machine's heartbeat says of its gate: it enforces table ``version`` of start ``boot``, or (None)
+        it has no table. The arbiter's record follows the report: a table of another start, a version this start has
+        not issued, or no table at all means the gate is not known to hold this start's zones."""
+        self.note_machine(machine_id)
+        ok = (boot is not None and version is not None and int(boot) == self.boot
+              and 0 <= int(version) <= self.table_version)
+        new = int(version) if ok else None
+        if self._acked.get(machine_id) != new:
+            if new is None:
+                self._acked.pop(machine_id, None)
+            else:
+                self._acked[machine_id] = new
+            self._log("TABLE_ACK", "", "", machine_id, None, epoch=-1 if new is None else new,
+                      reason="the gate enforces this table" if ok else "the gate does not hold this start's table")
+
+    def table_unacknowledged(self, resource_id: str, *, exclude: str | None = None) -> list[str]:
+        """Known machines, closed out of this zone, whose gates may not know it yet."""
+        z = self.zones.get(resource_id)
+        if z is None or self.scheme.gate == "none":
+            return []
+        since = self._zone_since.get(resource_id, 0)
+        return sorted(k for k in self._known
+                      if k != exclude and k not in z.compatible and self._acked.get(k, -1) < since)
 
     def planned(self, resource_id: str) -> str | None:
         r = self._res(resource_id)
@@ -631,6 +707,11 @@ class OccupancyArbiter(ReservationManager):
             # counted permits: their age is unknown across the restart, so each is counted afresh for T(1 + rho)
             r.live = {(h, int(e)): t for h, e in (d.get("live") or [])}
         self._log("RESTORED", "", "", None, None, reason=f"journal of boot {snap.get('boot')} taken up")
+        # the zones as the earlier start had them: in this start's table from its first version on
+        for z in zones_from_params({"conflict_zones": snap.get("zones") or []}):
+            self.zones[z.resource_id] = z
+            self._zone_since[z.resource_id] = 0
+            self._log_zone(z, 0)
 
     # ------------------------------------------------------------------ audits
     def audit_double_grants(self) -> list[dict[str, Any]]:
@@ -673,4 +754,5 @@ def zones_to_param(zones: Iterable[Zone]) -> str:
 
 
 __all__ = ["JournalUnavailable", "OccupancyArbiter", "OccupancyJournal", "PERMIT_REASON", "Scheme",
-           "VacancyEnvelope", "Zone", "boot_of_epoch", "replace", "zones_from_params", "zones_to_param"]
+           "VacancyEnvelope", "ZONE_TABLE_HEALTH_KEY", "ZONE_TABLE_REASON", "Zone", "boot_of_epoch", "replace",
+           "zones_from_params", "zones_to_param"]

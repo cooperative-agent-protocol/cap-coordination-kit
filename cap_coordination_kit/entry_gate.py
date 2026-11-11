@@ -55,7 +55,7 @@ class _Permit:
 class GateLogEntry:
     t_mono: float
     t_wall: float
-    event: str             # "admit" | "enter" | "exit" | "block" | "permit" | "void" | "request" | "late" | "deadman"
+    event: str             # "admit" | "enter" | "exit" | "block" | "permit" | "void" | "request" | "late" | "deadman" | "table"
     resource_id: str
     epoch: int | None = None
     reason: str = ""
@@ -83,6 +83,12 @@ class EntryGate:
     clock: Callable[[], float] = time.monotonic
     resend_s: float = 1.0                               # do not re-ask more often than this
     zones: dict[str, Zone] = field(default_factory=dict)
+    # The zone table of the Site: (the arbiter's start, the table's version), None until one has arrived. With
+    # ``require_table`` a gate that has no table, or no pose to judge a command by, lets no drive command through:
+    # a zone the gate has not heard of is one it cannot keep its machine out of.
+    require_table: bool = False
+    table: tuple[int, int] | None = None
+    _old_starts: set[int] = field(default_factory=set)   # starts of the arbiter whose table a later start's replaced
     log: list[GateLogEntry] = field(default_factory=list)
     _grants: dict[str, int] = field(default_factory=dict)     # mode "local": resource -> epoch of the grant notice
     _permits: dict[str, _Permit] = field(default_factory=dict)
@@ -108,6 +114,32 @@ class EntryGate:
             if self.machine_id in z.compatible:
                 continue                 # the loader is not gated by its own bay
             self.zones[z.resource_id] = z
+
+    def set_table(self, boot: int, version: int, zones: list[Zone]) -> None:
+        """The Site's zone table: it replaces what the gate knew (a zone no longer in it is no longer enforced). An
+        earlier table of the same start, and any table of a start whose table was already replaced, is an old message
+        and is dropped. (A restarted arbiter that has lost its zones sends no table while a permit of its earlier
+        start may still be good: ``OccupancyArbiter.table_withheld``.)"""
+        boot, version = int(boot), int(version)
+        if boot in self._old_starts:
+            return
+        if self.table is not None and self.table[0] == boot and version < self.table[1]:
+            return
+        if self.table is not None and self.table[0] != boot:
+            self._old_starts.add(self.table[0])
+        fresh = {z.resource_id: z for z in zones if self.machine_id not in z.compatible}
+        for rid in list(self.zones):
+            if rid not in fresh:
+                del self.zones[rid]
+        self.zones.update(fresh)
+        if self.table != (boot, version):
+            self.table = (boot, version)
+            self.log.append(GateLogEntry(t_mono=self.clock(), t_wall=time.time(), event="table", resource_id="",
+                                         epoch=version, reason=f"start {boot:08x}"))
+
+    def table_tag(self) -> str:
+        """What the machine reports in its heartbeat: the table its gate enforces ("" before the first)."""
+        return "" if self.table is None else f"{self.table[0]}:{self.table[1]}"
 
     def note_site_message(self) -> None:
         self._last_site = self.clock()
@@ -342,7 +374,21 @@ class EntryGate:
         """(why the command as proposed must not be written, the speed it may be written at): (None, None) lets it
         through as it is, (reason, 0.0) stops the drive, (reason, cap) lets it through scaled down to ``cap``.
         ``pose`` is (x, y, yaw) or (x, y, yaw, track speed) when the drive reports its speed."""
-        if self.mode == "none" or not self.zones or pose is None:
+        if self.mode == "none":
+            self._blocked_reason = None
+            return None, None
+        if self.require_table and (self.table is None or (self.zones and pose is None)):
+            # fail closed: nothing is known of the zones, or of where the machine is among them
+            if proposed is None or (abs(float(proposed[0])) < 1e-9 and abs(float(proposed[1])) < 1e-9):
+                return None, None
+            why = ("entry gate: no zone table from the Site yet" if self.table is None
+                   else "entry gate: no pose to check the zones against")
+            if self._blocked_reason != why:
+                self.log.append(GateLogEntry(t_mono=self.clock(), t_wall=time.time(), event="block",
+                                             resource_id="", reason=why))
+            self._blocked_reason = why
+            return why, 0.0
+        if not self.zones or pose is None:
             self._blocked_reason = None
             return None, None
         measured = float(pose[3]) if len(pose) > 3 and pose[3] is not None else None
@@ -467,4 +513,5 @@ def gate_from_env(machine_id: str, **kw: Any) -> EntryGate | None:
                                else None),
                      time_scale=float(os.environ.get("CAP_ENTRY_TIME_SCALE", "1.0")),
                      margin_m=float(os.environ.get("CAP_ENTRY_MARGIN_M", "0.1")),
+                     require_table=os.environ.get("CAP_ENTRY_REQUIRE_TABLE", "1") != "0",
                      resend_s=min(1.0, scheme.permit_ttl_s / 8.0), **kw)

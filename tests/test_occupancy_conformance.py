@@ -143,3 +143,18 @@ def test_a_restart_that_lost_the_journal_resets_the_model_whatever_the_guard_bec
           rec(3, 6.0, "GRANTED", "b", holder="b", epoch=2)]
     r = run(tx, gate_logs={}, scheme=mutex)
     assert r.conforming and r.restarts == 1
+
+
+def test_an_authorisation_before_the_other_gates_know_the_zone_is_caught():
+    table = dict(rec(0, -3.0, "TABLE", None, epoch=1), reason="zone at (0.00, 0.00) radius 9.00 m; open to zx200")
+    known = [dict(rec(0, -2.0, "MACHINE", m, rid=""), reason="known to the Site") for m in ("a", "b", "zx200")]
+    ack_a = dict(rec(0, -1.0, "TABLE_ACK", "a", rid="", epoch=1))
+    ack_b = dict(rec(0, -1.0, "TABLE_ACK", "b", rid="", epoch=1))
+    ok = run([table, *known, ack_a, ack_b, *clean()])
+    assert ok.conforming, ok.violations               # both carriers' gates know the bay; the loader is not asked
+    late = run([table, *known, ack_a, *clean()])      # a is let in although b's gate may not know the bay
+    assert not late.conforming and any("know the zone" in v["reason"] for v in late.violations), late.violations
+    # a refusal for that reason is one the rules ask for
+    refused = dict(rec(1, 0.0, "DENIED", "a"), reason="the zone table is not yet acknowledged by 'b'")
+    r = run([table, *known, refused], gate_logs={})
+    assert r.conforming and not r.unasked_refusals
