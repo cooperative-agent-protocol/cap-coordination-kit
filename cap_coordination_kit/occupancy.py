@@ -426,13 +426,16 @@ class OccupancyArbiter(ReservationManager):
             self._log("TABLE_ACK", "", "", machine_id, None, epoch=-1 if new is None else new,
                       reason="the gate enforces this table" if ok else "the gate does not hold this start's table")
 
-    def table_unacknowledged(self, resource_id: str, *, exclude: str | None = None) -> list[str]:
-        """Known machines, closed out of this zone, whose gates may not know it yet."""
+    def table_unacknowledged(self, resource_id: str, *, exclude: str | None = None,
+                             expect: Iterable[str] = ()) -> list[str]:
+        """Known machines, closed out of this zone, whose gates may not know it yet. ``expect`` adds machines the
+        caller is waiting for whether or not the Site has heard from them (a job's roster): the arbiter's own rule
+        can only name the machines it knows."""
         z = self.zones.get(resource_id)
         if z is None or self.scheme.gate == "none":
             return []
         since = self._zone_since.get(resource_id, 0)
-        return sorted(k for k in self._known
+        return sorted(k for k in self._known | set(expect)
                       if k != exclude and k not in z.compatible and self._acked.get(k, -1) < since)
 
     def planned(self, resource_id: str) -> str | None:
