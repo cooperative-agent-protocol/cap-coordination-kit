@@ -107,14 +107,23 @@ reference implementation.
 
 ## Scope
 
-This kit makes the **operational-P4 choreography**, its **sensitivity surface**,
-the **lease-lock baseline**, and the **per-transition conformance verdict**
-publicly reproducible, and lets the **arbiter and handover invariants** be
-unit-tested directly. It does **not** regenerate the contended
-fault-injection / handover campaigns or the physics witness — those run inside
-the closed reference implementation and are made *auditable* (published
-transition logs + per-run records), not re-runnable. See the paper's Data &
-Code Availability section.
+For the revised paper, the kit reproduces from public code the comparison of the
+five schemes scenario by scenario (`scheme_trial`, `segment_trial`), the
+calculations of the vacancy margin (`vacancy_margin`, `vacancy_design`) and the
+conformance verdict on the released records of the trials
+(`occupancy_conformance`). For the original submission it reproduces the
+**operational-P4 choreography**, its **sensitivity surface**, the **lease-lock
+baseline** and the **per-transition conformance verdict**. It does **not** re-run
+the paper's kinematic and physics campaigns: they use the closed reference
+implementation's Site, coordinator and machine agents, and are made *auditable*
+through their released records, not re-runnable. See the paper's Data and Code
+Availability section.
+
+## Security
+
+Please report a security issue privately, as described in
+[SECURITY.md](SECURITY.md). The continuous integration runs the tests against
+bindings generated from `cap-spec` and a CodeQL analysis.
 
 ## License
 

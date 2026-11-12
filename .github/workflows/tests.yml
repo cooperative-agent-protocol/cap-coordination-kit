@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 CAP Authors
+#
+# Unit tests against the public cap.v0 message definitions, generated from
+# cap-spec on every run.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out cap-spec (message definitions)
+        uses: actions/checkout@v7
+        with:
+          repository: cooperative-agent-protocol/cap-spec
+          path: _cap-spec
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install the protobuf compiler and pytest
+        run: python -m pip install grpcio-tools pytest
+
+      - name: Generate the cap.v0 Python bindings
+        run: |
+          mkdir -p _gen
+          python -m grpc_tools.protoc -I _cap-spec/proto --python_out=_gen \
+            $(find _cap-spec/proto -name '*.proto')
+
+      - name: Run the tests
+        env:
+          PYTHONPATH: ".:_gen"
+        run: python -m pytest tests -q
