@@ -267,6 +267,8 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
         elif ev == "VACATED":
             if m not in z.custody:
                 bad(res.violations, rec, f"vacancy confirmed for {m}, who is not in custody")
+            if scheme.gate == "permit" and any(h == m for (h, _e, _u) in z.live):
+                bad(res.violations, rec, f"vacancy confirmed for {m} while a permit of its own is counted")
             inside = true_inside(m, rid, t) if m else None
             if inside:
                 bad(res.sensing, rec, f"vacancy confirmed for {m} while it was inside the zone (true position)")

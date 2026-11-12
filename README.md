@@ -3,8 +3,10 @@
 A small, dependency-light **protocol-logic** carve of the CAP reference
 implementation. It contains **only protocol logic** — no LLM agents, no path
 planner, no physics simulator — so that the protocol-level results in the CAP
-paper *"A Model-Checked Coordination Protocol for Shared-Resource Handover in
-Autonomous Earthwork Fleets"* can be reproduced from open code, while the full
+paper *"Ownership and occupancy in shared-zone handover for autonomous earthwork
+fleets: a model-checked coordination protocol"* (revised version of *"A Model-Checked
+Coordination Protocol for Shared-Resource Handover in Autonomous Earthwork Fleets"*)
+can be reproduced from open code, while the full
 reference implementation (which carries proprietary agents and a third-party
 simulator) stays closed.
 
@@ -21,8 +23,9 @@ simulator) stays closed.
 | `occupancy.py` | The **occupancy-gated arbiter** of the revised paper and the family of schemes it runs: mutex released on completion, mutex group released on exit, renewable fenced lease, the lease with a vacancy check, and the proposed protocol (`Scheme.named`). Entry permits timed by the lease rule, custody until a confirmed vacancy (`VacancyEnvelope`), a journal with a restart guard. |
 | `entry_gate.py` | The machine-side **entry gate**: checks every drive command against the path to a stop under a model of the drive (command delay, acceleration limit, check period), slows or stops a machine that has no authority to enter a zone, stops a command that is not renewed, and lets a machine without authority inside a zone move out only. |
 | `occupancy_conformance.py` | Replays a trial's records (arbiter log, gate logs, true positions) against the rules of the occupancy model (`cap-spec/formal/tla/OccupancyHandover.tla`), independently of the arbiter's code. |
-| `scheme_trial.py` | A small deterministic simulation - two scripted carriers as unicycles, one loading bay - that runs the five schemes through five scenarios and reports which ones let two carriers into the bay at once. Public code only; reproducible bit for bit. |
+| `scheme_trial.py` | A small deterministic simulation - two scripted carriers as unicycles, one loading bay - that runs the five schemes through six scenarios (one of them with the custody rule switched off on request) and reports which ones let two carriers into the bay at once. Public code only; reproducible bit for bit. |
 | `vacancy_margin.py` | The probability of a **false vacancy confirmation** from the margin of the vacancy check and the spread of the position error (a Marcum Q-function), per report and over a custody episode; the margins that are necessary and sufficient when the error is bounded. No dependency. |
+| `vacancy_design.py` | The **allowance for position error** that the vacancy check's margin must leave, in standard deviations of the error, for a target probability of a false confirmation when `k` consecutive observations must show the machine out and the error is correlated from one observation to the next (exact recursion for independent errors; a grid integration otherwise, checked against both by `--selfcheck`). Needs numpy. |
 
 The only external dependency is the public **cap.v0** Protocol Buffer bindings
 (from [`cap-spec`](https://github.com/cooperative-agent-protocol/cap-spec) /
@@ -47,7 +50,7 @@ python3 -m cap_coordination_kit.sensitivity_surface
 python3 -m cap_coordination_kit.lease_lock
 #   lease steals total=15/25 cells; CAP deny-on-busy steals=0; audit flags=0
 
-# 5. The five schemes, five scenarios (revised paper: which scheme is safe where) - bit-exact
+# 5. The five schemes, six scenarios (revised paper: which scheme is safe where) - bit-exact
 python3 -m cap_coordination_kit.scheme_trial
 #   scenario                mutex_on_done          mutex_group         lease_fenced  lease_fenced_vacate                  cap
 #   nominal                safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)
@@ -55,13 +58,29 @@ python3 -m cap_coordination_kit.scheme_trial
 #   holder_silent          safe (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
 #   reenter_old            safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)       safe (4 loads)
 #   restart_lossy         S1+S2 (4 loads)       safe (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
-#   25 trials; records conform to the model in 25; 4918 arbiter transitions, 202 gate steps
+#   released_unused       S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)       safe (4 loads)       safe (4 loads)
+#
+#   30 trials; records conform to the model in 30; 5669 arbiter transitions, 252 gate steps
 #   (S1: two carriers inside the bay at once; S2: a carrier inside that the arbiter does not account for.
 #    One deterministic run per cell: "safe" here is one execution, not a proof - the exhaustive answer for each
-#    scheme is the model checker's, in cap-spec/formal/tla/family.)
+#    scheme is the model checker's, in cap-spec/formal/tla/family. released_unused: the Site gives the bay up for
+#    a carrier that holds an unused permit and cannot be told; its client backs it out of the vacancy envelope's
+#    reach and drives it in on the permit.)
+
+# 5b. The same without the custody rule (a machine leaves custody when seen outside, whatever permits of it are
+#     still counted): the two schemes with a vacancy check now fail in the new scenario, and their records no
+#     longer conform to the model
+python3 -m cap_coordination_kit.scheme_trial --no-custody-rule
+#   ...
+#   released_unused       S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)
 
 # 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 49 passed
+python3 -m pytest tests/ -q          # 54 passed
+
+# 6a. The design table of the vacancy margin (revised paper): allowance in standard deviations for k looks and a
+#     correlated error (needs numpy)
+python3 -m cap_coordination_kit.vacancy_design --selfcheck
+python3 -m cap_coordination_kit.vacancy_design
 
 # 6b. The risk of a false vacancy confirmation for a margin and an error spread (revised paper, Theorem 4)
 python3 -m cap_coordination_kit.vacancy_margin --radius 9 --margin 2.225 --sigma 0.5 1.5

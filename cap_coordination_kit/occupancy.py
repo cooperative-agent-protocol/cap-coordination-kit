@@ -76,6 +76,9 @@ class Scheme:
     permit_ttl_s: float = 30.0          # T: an entry permit's validity
     rho: float = 1e-3                   # bound on the relative rate error of a monotonic clock
     lease_ttl_s: float = 6.0            # a holder silent this long has stopped renewing
+    # The custody rule: a machine leaves custody only when it is seen out AND none of its permits is counted. Off
+    # (CAP_CUSTODY_UNTIL_LAPSE=0) only to measure what the rule prevents - the arbiter of the campaigns before it.
+    custody_until_lapse: bool = True
     name: str = ""
 
     _NAMED = {
@@ -107,7 +110,7 @@ class Scheme:
     @classmethod
     def from_env(cls) -> Scheme | None:
         """CAP_RESERVATION_SCHEME=<named> (unset: None, the plain ReservationManager). CAP_PERMIT_TTL_S, CAP_CLOCK_RHO
-        and CAP_LEASE_TTL_S override the timing."""
+        and CAP_LEASE_TTL_S override the timing; CAP_CUSTODY_UNTIL_LAPSE=0 turns the custody rule off (an ablation)."""
         name = os.environ.get("CAP_RESERVATION_SCHEME", "").strip()
         if not name:
             return None
@@ -116,6 +119,8 @@ class Scheme:
                          ("CAP_LEASE_TTL_S", "lease_ttl_s")):
             if os.environ.get(env):
                 kw[key] = float(os.environ[env])
+        if os.environ.get("CAP_CUSTODY_UNTIL_LAPSE", "1").strip() == "0":
+            kw["custody_until_lapse"] = False
         return cls.named(name, **kw)
 
     @property
@@ -163,6 +168,11 @@ class VacancyEnvelope:
     latency_s: float = 0.3              # link latency bound for the pose report
     d_brake_m: float = 1.0              # braking distance at top speed
     max_pose_age_s: float = 1.0         # an older pose is not used: the machine is not out
+    # A vacancy is confirmed after this many consecutive observations that show the machine out, each on a newer
+    # position report than the one before. With a deterministic eps one is enough. Where the error is only known
+    # by its spread, k independent reports take the chance of a false confirmation per look to its k-th power
+    # (Theorem "vacancy margin"); reports whose errors are correlated buy less.
+    looks: int = 1
 
     def inflation_m(self, pose_age_s: float) -> float:
         return self.eps_m + self.v_max_mps * (max(0.0, pose_age_s) + self.latency_s) + self.d_brake_m
@@ -180,6 +190,8 @@ class VacancyEnvelope:
                          ("CAP_VACANCY_MAX_AGE_S", "max_pose_age_s")):
             if os.environ.get(env):
                 kw[key] = float(os.environ[env])
+        if os.environ.get("CAP_VACANCY_LOOKS"):
+            kw["looks"] = max(1, int(os.environ["CAP_VACANCY_LOOKS"]))
         return cls(**kw)
 
 
@@ -272,6 +284,9 @@ class OccupancyArbiter(ReservationManager):
         self._r: dict[str, _Res] = {}
         self.zones: dict[str, Zone] = {}
         self._zone_refused: dict[str, tuple] = {}       # the last move of a zone that was refused (logged once)
+        # vacancy observations of a machine in custody: (zone, machine) -> [consecutive looks that showed it out,
+        # the report time of the last one counted, observations in all, sum of the reports' ages]
+        self._looks: dict[tuple[str, str], list[float]] = {}
         # what the vacancy check sees of the reported poses (None: the poses as reported). A trial's fault hook: the
         # position error A2 bounds is injected here, on the arbiter's view alone.
         self.observe_filter: Callable[[dict[str, Any]], dict[str, Any]] | None = None
@@ -621,9 +636,18 @@ class OccupancyArbiter(ReservationManager):
                             epoch=ep)
 
     # ------------------------------------------------------------------ API: vacancy, time, restarts
-    def confirm_vacant(self, resource_id: str, machine_id: str, *, now: float | None = None) -> bool:
+    def confirm_vacant(self, resource_id: str, machine_id: str, *, now: float | None = None,
+                       note: str = "") -> bool:
+        """Out of custody: the machine is seen outside AND none of its permits is still counted. A machine whose
+        bay was given up for it (the coordinator's release, a hand-over, an expiry) may hold a permit it has not
+        used; its gate hears of the release only by a notice, which a cut link withholds. Seen outside, it could
+        still drive in on that permit - after the arbiter had stopped accounting for it. So it stays in custody
+        until the permit can no longer be used (found while proving S1 for any number of machines, 2026-11-11: the
+        model had every release made by the machine's own agent, which drops the permit in the same step)."""
         r = self._res(resource_id)
         if machine_id not in r.custody:
+            return False
+        if self.scheme.custody_until_lapse and any(h == machine_id for (h, _e) in r.live):
             return False
         r.custody.discard(machine_id)
         try:
@@ -631,7 +655,7 @@ class OccupancyArbiter(ReservationManager):
         except JournalUnavailable:
             r.custody.add(machine_id)       # keep it until the record is durable
             return False
-        self._log("VACATED", resource_id, "", machine_id, r.holder, now=now)
+        self._log("VACATED", resource_id, "", machine_id, r.holder, reason=note, now=now)
         return True
 
     def observe(self, poses: dict[str, tuple[tuple[float, float] | None, float | None]], *,
@@ -644,10 +668,26 @@ class OccupancyArbiter(ReservationManager):
             z = self.zones.get(res_id)
             if z is None:
                 continue
+            for key in [k for k in self._looks if k[0] == res_id and k[1] not in r.custody]:
+                del self._looks[key]
             for m in sorted(r.custody):
                 pose, age = poses.get(m, (None, None))
-                if self.envelope.out_of(z, pose, age):
-                    self.confirm_vacant(res_id, m, now=now)
+                run = self._looks.setdefault((res_id, m), [0.0, -math.inf, 0.0, 0.0])
+                if pose is not None and age is not None:
+                    run[2] += 1
+                    run[3] += float(age)
+                if not self.envelope.out_of(z, pose, age):
+                    run[0] = 0.0                       # a look that does not show it out: the count starts again
+                    continue
+                stamp = self._clock() - float(age)
+                if stamp > run[1] + 1e-9:              # a newer report than the last one counted
+                    run[0] += 1
+                    run[1] = stamp
+                if run[0] >= self.envelope.looks:
+                    note = (f"looks={int(run[0])} age={float(age):.3f} obs={int(run[2])} "
+                            f"age_mean={run[3] / max(1.0, run[2]):.3f}")
+                    if self.confirm_vacant(res_id, m, now=now, note=note):
+                        self._looks.pop((res_id, m), None)
         if self.guard == "waitVacancy" and poses and self.zones:
             if all(self.envelope.out_of(z, *poses.get(m, (None, None)))
                    for z in self.zones.values() for m in poses if m not in z.compatible):

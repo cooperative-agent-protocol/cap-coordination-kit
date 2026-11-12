@@ -11,12 +11,13 @@ from cap_coordination_kit.scheme_trial import ACCEL, DELAY_S, DT, Clock, Unicycl
 
 UNSAFE = {("release_early", "mutex_on_done"), ("release_early", "lease_fenced"),
           ("holder_silent", "lease_fenced"),
-          ("restart_lossy", "mutex_on_done"), ("restart_lossy", "lease_fenced")}
+          ("restart_lossy", "mutex_on_done"), ("restart_lossy", "lease_fenced"),
+          ("released_unused", "mutex_on_done"), ("released_unused", "mutex_group"), ("released_unused", "lease_fenced")}
 
 
 def test_the_table_is_the_models():
     results = run_all()
-    assert len(results) == 25
+    assert len(results) == 30
     for r in results:
         assert r.conforming, (r.scheme, r.scenario, r.notes)
         assert r.unadmitted_entries == 0

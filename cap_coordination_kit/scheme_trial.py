@@ -16,6 +16,13 @@ Scenarios (the holder is the carrier loading when the scenario starts):
     holder_silent    the holder's link is cut for 90 s while it is inside; it stands still, then leaves
     reenter_old      after its turn a carrier is driven back in while the other holds the bay
     restart_lossy    the arbiter restarts during a load and has lost its journal
+    released_unused  a carrier on its approach has just been given an entry permit (with a gate that remembers
+                     grants: the grant) and its link drops; the Site gives its bay up for it, and the notice cannot
+                     reach it; its client backs it out of the vacancy envelope's reach, where the arbiter sees it
+                     clear of the bay, and then drives it in on the permit it still holds
+
+``run_trial(..., custody_until_lapse=False)`` runs the arbiter without the custody rule (a machine leaves custody as
+soon as it is seen outside, whatever permits of it are still counted): what the rule prevents.
 
 Oracles, from the simulated true positions: S1 two carriers inside the bay at once; S2 a carrier inside that the
 arbiter accounts neither as holder nor in custody. The run's records are also replayed against the model's rules
@@ -56,7 +63,8 @@ DELAY_S, ACCEL = 0.3, 1.0          # the drive: command delay, acceleration limi
 V_MAX = 1.5
 LOAD_S = 40.0
 PERMIT_T, LEASE_T, DELTA_ENTRY = 24.0, 48.0, 4.0
-SCENARIOS = ("nominal", "release_early", "holder_silent", "reenter_old", "restart_lossy")
+SELF_REPORT = False               # True: the arbiter sees a machine's position only while its link is up
+SCENARIOS = ("nominal", "release_early", "holder_silent", "reenter_old", "restart_lossy", "released_unused")
 SCHEMES = ("mutex_on_done", "mutex_group", "lease_fenced", "lease_fenced_vacate", "cap")
 
 
@@ -100,13 +108,14 @@ class Carrier:
     gate: EntryGate
     stage: tuple[float, float]
     load_pose: tuple[float, float]
-    phase: str = "wait"            # wait | approach | load | leave | idle | rogue
+    phase: str = "wait"            # wait | approach | load | leave | idle | rogue | backoff | rogue_in
     rid: str = ""
     n: int = 0
     loaded_until: float = 0.0
     link_up: bool = True
     loads: int = 0
     next_request: float = 0.0
+    until: float = 0.0
 
 
 @dataclass
@@ -150,9 +159,11 @@ def _write(c: Carrier, t: float, v: float, w: float) -> None:
     c.body.command(t, v, w)
 
 
-def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, horizon_s: float = 600.0) -> TrialResult:
+def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, horizon_s: float = 600.0,
+              custody_until_lapse: bool = True) -> TrialResult:
     clock = Clock()
-    scheme = Scheme.named(scheme_name, permit_ttl_s=PERMIT_T, lease_ttl_s=LEASE_T)
+    scheme = Scheme.named(scheme_name, permit_ttl_s=PERMIT_T, lease_ttl_s=LEASE_T,
+                          custody_until_lapse=custody_until_lapse)
     zone = Zone(BAY, 0.0, 0.0, BAY_R, frozenset({"loader"}))
     envelope = VacancyEnvelope(eps_m=0.5, v_max_mps=V_MAX, latency_s=0.2, d_brake_m=V_MAX ** 2 / (2 * ACCEL),
                                max_pose_age_s=1.0)
@@ -206,13 +217,14 @@ def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, hori
             return True
         return False
 
-    def release(c: Carrier, why: str) -> None:
+    def release(c: Carrier, why: str, *, told: bool = True) -> None:
         rid = arb[0].reservation_id_of(BAY) if arb[0].holder_of(BAY) == c.name else None
         if rid is None:
             return
         epoch = arb[0].epoch(arb[0]._res(BAY).gen)
         arb[0].release(site_agent_pb2.ReservationRelease(reservation_id=rid, reason=why))
-        c.gate.revoke(BAY, epoch, reason=why)          # the machine is told its grant ended
+        if told:
+            c.gate.revoke(BAY, epoch, reason=why)      # the machine is told its grant ended
         new = arb[0].holder_of(BAY)                    # a designated scheme has handed the bay over
         if new is not None and new != c.name:
             carriers[new].gate.note_grant(BAY, arb[0].epoch(arb[0]._res(BAY).gen))
@@ -244,6 +256,16 @@ def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, hori
                     log.append(rec)
                 arb[0]._txlog, arb[0]._seq = log, seq + len(started)
                 res.notes.append(f"arbiter restarted without its journal at {t - t0:.1f} s (guard {arb[0].guard})")
+        if scenario == "released_unused" and not fired["scenario"]:
+            for c in carriers.values():
+                if c.phase == "approach" and holder == c.name and not inside[c.name] and c.gate.may_start_entry(BAY):
+                    fired["scenario"] = True
+                    c.link_up, cut_until = False, t + 60.0
+                    c.gate.note_link_down()
+                    release(c, "given up for the holder", told=False)    # the notice finds no link
+                    c.phase, c.until = "backoff", t + 4.0
+                    res.notes.append(f"bay given up for {c.name} with its authority unused at {t - t0:.1f} s")
+                    break
         if cut_until and t >= cut_until:
             for c in carriers.values():
                 if not c.link_up:
@@ -279,6 +301,14 @@ def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, hori
             elif c.phase == "rogue":
                 if _drive_to(c, c.load_pose, t) or t - t0 > horizon_s - 60:
                     c.phase = "leave"
+            elif c.phase == "backoff":                  # straight back, out of the envelope's reach; then a pause
+                _write(c, t, -0.8 if t < c.until else 0.0, 0.0)
+                if t >= c.until + 1.5:
+                    c.phase, c.until = "rogue_in", t + 40.0
+            elif c.phase == "rogue_in":                 # in on whatever authority its gate still holds
+                arrived = _drive_to(c, c.load_pose, t)
+                if (arrived or t >= c.until) and c.link_up:
+                    c.phase = "leave"
             else:
                 _drive_to(c, c.stage, t)
         # ---- the world and the arbiter
@@ -290,7 +320,9 @@ def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, hori
             for i, (n, c) in enumerate(carriers.items()):
                 # a fixed, repeatable pseudo-error when asked for (no random numbers anywhere in the kit)
                 e = noise_sigma * math.sin(0.7 * k + 1.3 * i) * 1.6
-                obs[n] = ((c.body.x + e, c.body.y - e), 0.0) if c.link_up else (None, None)
+                # the positions stand for sensing at the Site, which a cut link does not stop (as in the paper's
+                # trials); with SELF_REPORT they come over the machine's own link and stop with it
+                obs[n] = ((c.body.x + e, c.body.y - e), 0.0) if (c.link_up or not SELF_REPORT) else (None, None)
             arb[0].observe(obs)
             arb[0].tick(last_heartbeat=dict(heard))
         for n, c in carriers.items():
@@ -319,8 +351,9 @@ def run_trial(scheme_name: str, scenario: str, *, noise_sigma: float = 0.0, hori
     return res
 
 
-def run_all(noise_sigma: float = 0.0) -> list[TrialResult]:
-    return [run_trial(s, sc, noise_sigma=noise_sigma) for sc in SCENARIOS for s in SCHEMES]
+def run_all(noise_sigma: float = 0.0, *, custody_until_lapse: bool = True) -> list[TrialResult]:
+    return [run_trial(s, sc, noise_sigma=noise_sigma, custody_until_lapse=custody_until_lapse)
+            for sc in SCENARIOS for s in SCHEMES]
 
 
 def table(results: list[TrialResult]) -> str:
@@ -340,8 +373,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default="")
     ap.add_argument("--noise", type=float, default=0.0, help="amplitude scale of a fixed position error at the arbiter")
+    ap.add_argument("--no-custody-rule", action="store_true",
+                    help="the arbiter without the custody rule: a machine leaves custody when seen outside, whatever "
+                         "permits of it are still counted (what the rule prevents)")
     args = ap.parse_args()
-    results = run_all(args.noise)
+    results = run_all(args.noise, custody_until_lapse=not args.no_custody_rule)
     print(table(results))
     bad = [r for r in results if not r.conforming]
     print(f"\n{len(results)} trials; records conform to the model in {len(results) - len(bad)}; "
