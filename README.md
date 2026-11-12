@@ -24,6 +24,8 @@ simulator) stays closed.
 | `entry_gate.py` | The machine-side **entry gate**: checks every drive command against the path to a stop under a model of the drive (command delay, acceleration limit, check period), slows or stops a machine that has no authority to enter a zone, stops a command that is not renewed, and lets a machine without authority inside a zone move out only. |
 | `occupancy_conformance.py` | Replays a trial's records (arbiter log, gate logs, true positions) against the rules of the occupancy model (`cap-spec/formal/tla/OccupancyHandover.tla`), independently of the arbiter's code. |
 | `scheme_trial.py` | A small deterministic simulation - two scripted carriers as unicycles, one loading bay - that runs the five schemes through six scenarios (one of them with the custody rule switched off on request) and reports which ones let two carriers into the bay at once. Public code only; reproducible bit for bit. |
+| `zones.py` | A conflict zone of another shape for the same arbiter and gate: a **single-lane segment** of road (the distance to a line segment instead of to a point). The arbiter and the gate use a zone only through that distance and the zone's reach. |
+| `segment_trial.py` | The five schemes on the single-lane segment, crossed from both ends by two carriers: the same arbiter, gate, drive and oracles as `scheme_trial.py`, a different geometry. The schemes fail on the lane where they fail at the bay. |
 | `vacancy_margin.py` | The probability of a **false vacancy confirmation** from the margin of the vacancy check and the spread of the position error (a Marcum Q-function), per report and over a custody episode; the margins that are necessary and sufficient when the error is bounded. No dependency. |
 | `vacancy_design.py` | The **allowance for position error** that the vacancy check's margin must leave, in standard deviations of the error, for a target probability of a false confirmation when `k` consecutive observations must show the machine out and the error is correlated from one observation to the next (exact recursion for independent errors; a grid integration otherwise, checked against both by `--selfcheck`). Needs numpy. |
 
@@ -74,8 +76,15 @@ python3 -m cap_coordination_kit.scheme_trial --no-custody-rule
 #   ...
 #   released_unused       S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)      S1+S2 (4 loads)
 
+# 5c. A second kind of space: the same schemes on a single-lane stretch of road crossed from both ends
+python3 -m cap_coordination_kit.segment_trial
+#   scenario                  mutex_on_done            mutex_group           lease_fenced    lease_fenced_vacate                    cap
+#   nominal              safe (4 crossings)     safe (4 crossings)     safe (4 crossings)     safe (4 crossings)     safe (4 crossings)
+#   release_early       S1+S2 (4 crossings)     safe (4 crossings)    S1+S2 (4 crossings)     safe (4 crossings)     safe (4 crossings)
+#   holder_silent        safe (4 crossings)     safe (4 crossings)    S1+S2 (4 crossings)     safe (4 crossings)     safe (4 crossings)
+
 # 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 54 passed
+python3 -m pytest tests/ -q          # 56 passed
 
 # 6a. The design table of the vacancy margin (revised paper): allowance in standard deviations for k looks and a
 #     correlated error (needs numpy)
