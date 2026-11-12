@@ -28,6 +28,7 @@ simulator) stays closed.
 | `segment_trial.py` | The five schemes on the single-lane segment, crossed from both ends by two carriers: the same arbiter, gate, drive and oracles as `scheme_trial.py`, a different geometry. The schemes fail on the lane where they fail at the bay. |
 | `vacancy_margin.py` | The probability of a **false vacancy confirmation** from the margin of the vacancy check and the spread of the position error (a Marcum Q-function), per report and over a custody episode; the margins that are necessary and sufficient when the error is bounded. No dependency. |
 | `vacancy_design.py` | The **allowance for position error** that the vacancy check's margin must leave, in standard deviations of the error, for a target probability of a false confirmation when `k` consecutive observations must show the machine out and the error is correlated from one observation to the next (exact recursion for independent errors; a grid integration otherwise, checked against both by `--selfcheck`). Needs numpy. |
+| `family_fuzz.py` | Randomised executions of the arbiter's own code for all **90 schemes of the family**: an untrusted client that requests, releases and hands over in any machine's name, delayed and lost messages, clocks drifting within rho, restarts of machines and of the arbiter with or without its journal, and the machines' true positions at the Site; S1-S3 checked after every step. The schemes without a violation are the ones the model checker finds safe, in each of four environments (Site-side or own releases, journal kept or lost), and removing the custody rule, the bound on clock drift or sound vacancy sensing breaks every one of them. Randomised runs find violations; they do not prove that there are none. |
 
 The only external dependency is the public **cap.v0** Protocol Buffer bindings
 (from [`cap-spec`](https://github.com/cooperative-agent-protocol/cap-spec) /
@@ -84,7 +85,7 @@ python3 -m cap_coordination_kit.segment_trial
 #   holder_silent        safe (4 crossings)     safe (4 crossings)    S1+S2 (4 crossings)     safe (4 crossings)     safe (4 crossings)
 
 # 6. Arbiter + Handover invariants (no-double-grant, atomic transfer, monitor, surface, lease)
-python3 -m pytest tests/ -q          # 56 passed
+python3 -m pytest tests/ -q          # 64 passed
 
 # 6a. The design table of the vacancy margin (revised paper): allowance in standard deviations for k looks and a
 #     correlated error (needs numpy)
@@ -95,6 +96,12 @@ python3 -m cap_coordination_kit.vacancy_design
 python3 -m cap_coordination_kit.vacancy_margin --radius 9 --margin 2.225 --sigma 0.5 1.5
 #   sigma 0.50 m, 0.50 m inside: 2.91e-08 per report / 0.000 over 20 reports
 #   sigma 1.50 m, 0.50 m inside: 4.09e-02 per report / 0.567 over 20 reports
+
+# 8. The family of schemes on the arbiter's own code (a few minutes per environment); each line ends with how
+#    many schemes ran without a violation and how many agree with the model checker
+python3 -m cap_coordination_kit.family_fuzz --env site --journal kept      # 8 of 90; 90 agree
+python3 -m cap_coordination_kit.family_fuzz --env own --journal kept       # 12 of 90; 90 agree
+python3 -m cap_coordination_kit.family_fuzz --schemes safe --ablate custody   # 0 of 8; 8 agree
 
 # 7. Re-derive the per-transition conformance verdict from a shipped campaign log
 python3 -m cap_coordination_kit.refinement_monitor <path>/reservation_txlog.jsonl
