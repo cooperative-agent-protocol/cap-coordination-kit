@@ -40,8 +40,10 @@ pose error, not by the arbiter). A trial conforms when the first two are empty.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -147,7 +149,8 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
 
     for rec in tx:
         ev, rid, m = rec.get("event"), rec.get("resource_id") or "", rec.get("requested_holder")
-        t = float(rec.get("t_mono") or 0.0)
+        # each step is judged when the arbiter decided it (decision_times_from_journal), not at its later record
+        t = float(rec.get("t_decided", rec.get("t_mono") or 0.0))
         res.transitions += 1
         res.event_counts[ev] = res.event_counts.get(ev, 0) + 1
         if ev == "TABLE":
@@ -246,7 +249,8 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
                 bad(res.violations, rec, f"a permit while a permit of {inc_l} is counted")
             if table_late(rid, m):
                 bad(res.violations, rec, f"a permit before the gates of {table_late(rid, m)} know the zone")
-            z.live.append((m, int(rec.get("epoch") or 0), t + life))
+            # counted from the arbiter's decision ("t_counted"), which precedes the record by the journal's write
+            z.live.append((m, int(rec.get("epoch") or 0), float(rec.get("t_counted", t)) + life))
         elif ev == "RELEASED":
             holder = rec.get("prior_holder")
             if z.holder != holder:
@@ -306,7 +310,7 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
     cur: dict[str, tuple[str, float] | None] = {}
     for rec in tx:
         ev, rid, m, t = rec.get("event"), rec.get("resource_id") or "", rec.get("requested_holder"), \
-            float(rec.get("t_mono") or 0.0)
+            float(rec.get("t_decided", rec.get("t_mono") or 0.0))
         if not rid:
             continue
         if ev in ("GRANTED", "HANDOVER"):
@@ -322,17 +326,44 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
         if c is not None:
             grants.setdefault((c[0], rid), []).append((c[1], None))
     for mid, events in (gate_logs or {}).items():
-        used: set[int] = set()
+        # the gate's own view of its permit for each zone, from its records when it keeps them (receipts, voids,
+        # entries): a permit serves one entry (the gate drops it at the entry), a void ends it, and a new receipt
+        # replaces it. The receipt answers the request sent just before it, from which the machine times it.
+        receipts_logged = any(e.get("event") == "permit" for e in events)
+        held: dict[str, tuple[int, float | None] | None] = {}   # zone -> (epoch, the request it answers) or None
+        last_request: dict[str, float] = {}
         for e in events:
             ev, rid, t = e.get("event"), e.get("resource_id") or "", float(e.get("t_mono") or 0.0)
+            if ev == "request":
+                last_request[rid] = t
+                continue
+            if ev == "permit" and e.get("epoch") is not None:
+                held[rid] = (int(e["epoch"]), last_request.get(rid))
+                continue
+            if ev == "void":
+                had = held.get(rid)
+                if had is not None and (e.get("epoch") in (None, 0) or int(e["epoch"]) == had[0]):
+                    held[rid] = None
+                continue
             if ev == "enter":
                 res.gate_steps += 1
                 if e.get("reason") == "not admitted":
                     res.violations.append({"event": "enter", "machine": mid, "resource_id": rid, "t_mono": t,
                                            "reason": "entered without an admission of its gate"})
+                held[rid] = None                       # the entry uses the permit up
                 continue
             if ev != "admit":
                 continue
+            if scheme.gate == "permit" and receipts_logged:
+                had, ep = held.get(rid), e.get("epoch")
+                if had is None or ep is None or int(ep) != had[0]:
+                    res.violations.append({"event": "admit", "machine": mid, "resource_id": rid, "t_mono": t,
+                                           "reason": f"admitted on a permit ({ep}) it did not hold unused "
+                                                     f"(holds {had[0] if had else None})"})
+                elif had[1] is not None and t - had[1] > m_life + 1e-3:
+                    res.violations.append({"event": "admit", "machine": mid, "resource_id": rid, "t_mono": t,
+                                           "reason": f"admitted {t - had[1]:.2f} s after the request its permit "
+                                                     f"answered (usable for {m_life:.2f} s on the machine's clock)"})
             res.gate_steps += 1
             if scheme.gate == "local":
                 ok = any(a <= t + 0.5 for (a, _b) in grants.get((mid, rid), []))    # a grant notice once received
@@ -351,7 +382,6 @@ def check_trial(*, txlog: list[dict[str, Any]], gate_logs: dict[str, list[dict[s
                     res.violations.append({"event": "admit", "machine": mid, "resource_id": rid, "t_mono": t,
                                            "reason": f"admitted {t - newest:.1f} s after its permit was issued "
                                                      f"(usable for {m_life:.1f} s)"})
-                used.add(int(ep or 0))
     return res
 
 
@@ -400,9 +430,75 @@ def check_trial_dir(d: str | Path) -> OccupancyConformance | None:
     t0_mono = None
     if t0_wall is not None:
         t0_mono = float(tx[0]["t_mono"]) - (float(tx[0]["t_wall"]) - t0_wall)
+    decision_times_from_journal(d, tx, gate_logs)
     return check_trial(txlog=tx, gate_logs=gate_logs, poses=poses, zones=zones, carriers=carriers, scheme=scheme,
                        permit_life_s=_wall_life(m, scheme, sp),
                        machine_permit_life_s=_wall_life(m, scheme, sp, arbiter=False), t0_mono=t0_mono)
+
+
+JOIN_TOL_S = 0.005          # the error of joining a snapshot's wall-clock time to the monotonic clock (measured: < 3 ms)
+
+
+def decision_times_from_journal(d: Path, tx: list[dict[str, Any]], gate_logs: dict[str, list[dict]]) -> int:
+    """Give each step of the arbiter that changes its state the time it was decided ("t_decided"), and each PERMIT
+    the time the arbiter began to count it ("t_counted"); returns how many records were given one.
+
+    A grant, a permit, a release, a hand-over and a confirmed vacancy take effect in the arbiter's memory when they are
+    decided; the arbiter then builds its journal's snapshot (which takes its wall-clock time then), writes and syncs
+    it, and only then logs the step. The record's monotonic time is therefore later than the decision by the write:
+    up to 0.9 s in the kinematic trials, 3.3 s on a loaded physics node, 59 s once. Judged at the record's time, the
+    state looks as if it changed later than it did - a permit counted for longer, a machine taken off the account
+    later - which makes the oracles lenient. The snapshot written for a step is the last one built after the
+    record before it and not after its own (the write and the record follow each other with no wait in between, so no
+    other step's snapshot falls in between), and it shows the step's effect, which is checked. Its wall-clock time is
+    joined to the monotonic clock through the gates' records, which take both together. An expiry is logged before its
+    snapshot is written, so its record's time is its decision's. A record already carrying the times (the arbiter
+    logs them since 11-13) keeps them; one whose snapshot is missing keeps its record's time."""
+    jp = d / "state" / "occupancy_journal.jsonl"
+    pairs = [float(e["t_mono"]) - float(e["t_wall"]) for es in (gate_logs or {}).values() for e in es
+             if "t_mono" in e and "t_wall" in e]
+    if not jp.exists() or not pairs:
+        return 0
+    k = statistics.median(pairs)
+    snaps: list[tuple[float, dict[str, Any]]] = []
+    for line in jp.read_text().splitlines():
+        try:
+            s = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "t_wall" in s:
+            snaps.append((float(s["t_wall"]) + k, s))
+    snaps.sort(key=lambda p: p[0])
+    times = [p[0] for p in snaps]
+    given = 0
+    prev_t = -math.inf
+    for rec in sorted(tx, key=lambda r: r.get("seq", 0)):
+        t = float(rec.get("t_mono") or 0.0)
+        ev, rid, m = rec.get("event"), rec.get("resource_id") or "", rec.get("requested_holder")
+        lo, prev_t = prev_t, t
+        if ev not in ("GRANTED", "HANDOVER", "PERMIT", "RELEASED", "VACATED") or not rid or "t_decided" in rec:
+            continue
+        i = bisect.bisect_right(times, t + JOIN_TOL_S)
+        if i == 0 or times[i - 1] <= lo - JOIN_TOL_S:
+            continue                                   # no snapshot between the previous record and this one
+        t_snap, snap = snaps[i - 1]
+        st = (snap.get("res") or {}).get(rid) or {}
+        shows = {"GRANTED": lambda: st.get("holder") == m, "HANDOVER": lambda: st.get("holder") == m,
+                 "PERMIT": lambda: any(h == m and int(e) == int(rec.get("epoch") or 0) for h, e in st.get("live") or []),
+                 "RELEASED": lambda: st.get("holder") is None,
+                 "VACATED": lambda: m not in (st.get("custody") or [])}[ev]()
+        if not shows:
+            continue
+        rec["t_decided"] = min(t, t_snap)
+        if ev == "PERMIT" and "t_counted" not in rec:
+            rec["t_counted"] = rec["t_decided"]
+        given += 1
+    return given
+
+
+def _permit_starts_from_journal(d: Path, tx: list[dict[str, Any]], gate_logs: dict[str, list[dict]]) -> None:
+    """The permits' starts (and every other step's decision time) from the journal: decision_times_from_journal."""
+    decision_times_from_journal(d, tx, gate_logs)
 
 
 def _wall_life(m: dict[str, Any], scheme: Scheme, sp: float, *, arbiter: bool = True) -> float:

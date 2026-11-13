@@ -15,7 +15,8 @@ member of the scheme family there, so the conventional schemes and CAP run on th
               successor is an atomic hand-over
 
 Named members (``Scheme.named``): mutex_on_done, mutex_group (Open-RMF-style: held until the robot is out),
-lease_fenced (renewable lease with fenced, time-limited permits), lease_fenced_vacate, cap.
+lease_fenced (renewable lease with fenced, time-limited permits), lease_fenced_vacate, cap, and
+lease_fenced_vacate_queued (the lease with a vacancy check and a FIFO queue).
 
 Entry permits and the lease lemma (A4). A machine times a permit from the moment it SENT its permit request, for
 T(1 - rho) on its monotonic clock (``EntryGate``); the arbiter counts it as possibly in use for T(1 + rho) on its own
@@ -88,6 +89,10 @@ class Scheme:
         "lease_fenced_vacate": dict(arb="deny", gate="permit", release="onVacate", expiry="ttlVacate",
                                     succession="free"),
         "cap": dict(arb="queue", gate="permit", release="onVacate", expiry="ttlVacate", succession="designated"),
+        # the lease with a vacancy check and a FIFO queue, as a lock recipe with ordered waiters has it: the
+        # protocol without designation (added after the final campaigns to tell the queue's effect from the plan's)
+        "lease_fenced_vacate_queued": dict(arb="queue", gate="permit", release="onVacate", expiry="ttlVacate",
+                                           succession="free"),
     }
 
     def __post_init__(self) -> None:
@@ -348,6 +353,7 @@ class OccupancyArbiter(ReservationManager):
 
     def _snapshot(self) -> dict[str, Any]:
         return {"v": 2, "boot": self.boot, "t_wall": time.time(), "scheme": self.scheme.name or asdict(self.scheme),
+                "guard": self.guard,
                 "zones": json.loads(zones_to_param(self.zones.values())),
                 "res": {k: {"holder": r.holder, "rid": r.rid, "gen": r.gen, "custody": sorted(r.custody),
                             "live": [[h, e] for (h, e) in r.live]} for k, r in self._r.items()}}
@@ -356,9 +362,18 @@ class OccupancyArbiter(ReservationManager):
         if self._journal is not None:
             self._journal.write(self._snapshot())
 
+    def _persist_quietly(self) -> None:
+        """Record a change that only makes a later restart less cautious (the zones opened): if the write fails,
+        the journal still says closed, and a restart waits again - safe."""
+        try:
+            self._persist()
+        except JournalUnavailable:
+            pass
+
     def _log(self, event: str, resource_id: str, reservation_id: str, holder: str | None, prior: str | None, *,
              epoch: int | None = None, reason: str = "", now: float | None = None,
-             planned_before: str | None = None) -> None:
+             planned_before: str | None = None, t_counted: float | None = None,
+             t_decided: float | None = None) -> None:
         r = self._res(resource_id) if resource_id else None
         self._seq += 1
         rec = {"seq": self._seq, "t_wall": now if now is not None else time.time(), "t_mono": self._clock(),
@@ -369,6 +384,13 @@ class OccupancyArbiter(ReservationManager):
                "planned": (r.queue[0][0] if (r is not None and r.queue) else None),
                "planned_before": planned_before,
                "guard": self.guard, "reason": reason, "scheme": self.scheme.name}
+        if t_counted is not None:
+            # a permit is counted from the decision, before the journal's write that precedes this record
+            rec["t_counted"] = t_counted
+        if t_decided is not None:
+            # the step took effect when it was decided, before the journal's write (up to 3 s on a loaded node):
+            # the oracles judge the arbiter's state from here, not from this record's later time
+            rec["t_decided"] = t_decided
         self._txlog.append(rec)
         if self._on_transition is not None:
             try:
@@ -546,7 +568,8 @@ class OccupancyArbiter(ReservationManager):
             return self._status(rid, res_id, m, _State.RESERVATION_STATE_DENIED, reason="journal unavailable")
         self._dequeue(r, m)
         ep = self.epoch(r.gen)
-        self._log("GRANTED", res_id, rid, m, prior, epoch=ep, now=now, planned_before=planned_before)
+        self._log("GRANTED", res_id, rid, m, prior, epoch=ep, now=now, planned_before=planned_before,
+                  t_decided=r.t_grant)
         return self._status(rid, res_id, m, _State.RESERVATION_STATE_GRANTED, epoch=ep)
 
     def _request_permit(self, req: Any, *, now: float | None) -> Any:
@@ -570,7 +593,8 @@ class OccupancyArbiter(ReservationManager):
             self.denied_by_journal += 1
             self._log("PERMIT_DENIED", res_id, rid, m, r.holder, reason=f"journal unavailable: {exc}", now=now)
             return self._status(rid, res_id, m, _State.RESERVATION_STATE_DENIED, reason="journal unavailable")
-        self._log("PERMIT", res_id, rid, m, r.holder, epoch=ep, now=now)
+        self._log("PERMIT", res_id, rid, m, r.holder, epoch=ep, now=now, t_counted=r.live[(m, ep)],
+                  t_decided=r.live[(m, ep)])
         return self._status(rid, res_id, m, _State.RESERVATION_STATE_GRANTED, reason=PERMIT_REASON, epoch=ep)
 
     def release(self, rel: Any, *, now: float | None = None) -> Any:
@@ -591,6 +615,7 @@ class OccupancyArbiter(ReservationManager):
         r.holder, r.rid = None, None
         if self.scheme.release == "onVacate" and m is not None and resource_id_has_zone(self, res_id):
             r.custody.add(m)
+        t_dec = self._clock()
         try:
             self._persist()
         except JournalUnavailable:
@@ -598,7 +623,7 @@ class OccupancyArbiter(ReservationManager):
             # admitted on a record that did not reach the disk.
             if m is not None:
                 r.custody.add(m)
-        self._log("RELEASED", res_id, rid, m, m, reason=rel.reason, now=now)
+        self._log("RELEASED", res_id, rid, m, m, reason=rel.reason, now=now, t_decided=t_dec)
         return self._status(rid, res_id, m or "", _State.RESERVATION_STATE_RELEASED, reason=rel.reason)
 
     def holder_of_reservation(self, reservation_id: str) -> str | None:
@@ -631,7 +656,7 @@ class OccupancyArbiter(ReservationManager):
         self._dequeue(r, receiver_id)
         ep = self.epoch(r.gen)
         self._log("HANDOVER", resource_id, receiver_reservation_id, receiver_id, sender, epoch=ep, now=now,
-                  planned_before=planned_before)
+                  planned_before=planned_before, t_decided=r.t_grant)
         return self._status(receiver_reservation_id, resource_id, receiver_id, _State.RESERVATION_STATE_GRANTED,
                             epoch=ep)
 
@@ -650,12 +675,13 @@ class OccupancyArbiter(ReservationManager):
         if self.scheme.custody_until_lapse and any(h == machine_id for (h, _e) in r.live):
             return False
         r.custody.discard(machine_id)
+        t_dec = self._clock()
         try:
             self._persist()
         except JournalUnavailable:
             r.custody.add(machine_id)       # keep it until the record is durable
             return False
-        self._log("VACATED", resource_id, "", machine_id, r.holder, reason=note, now=now)
+        self._log("VACATED", resource_id, "", machine_id, r.holder, reason=note, now=now, t_decided=t_dec)
         return True
 
     def observe(self, poses: dict[str, tuple[tuple[float, float] | None, float | None]], *,
@@ -693,6 +719,7 @@ class OccupancyArbiter(ReservationManager):
                    for z in self.zones.values() for m in poses if m not in z.compatible):
                 self.guard = "open"
                 self._guard_since = self._clock()
+                self._persist_quietly()
                 self._log("GUARD_OPEN", "", "", None, None, reason="every machine confirmed out", now=now)
 
     def operator_confirm_all_vacant(self) -> None:
@@ -700,6 +727,7 @@ class OccupancyArbiter(ReservationManager):
         for r in self._r.values():
             r.custody.clear()
         self.guard = "open"
+        self._persist_quietly()
         self._log("GUARD_OPEN", "", "", None, None, reason="operator confirmed every bay empty")
 
     def tick(self, *, last_heartbeat: dict[str, float] | None = None, now: float | None = None) -> None:
@@ -717,6 +745,7 @@ class OccupancyArbiter(ReservationManager):
         if self.guard == "waitTime" and t - self._guard_since >= life:
             self.guard = "waitVacancy" if self.scheme.occ_aware else "open"
             self._guard_since = t
+            changed = True                       # the journal records the guard (a later restart reads it)
             self._log("GUARD_" + self.guard.upper(), "", "", None, None, reason="restart grace period over", now=now)
         if last_heartbeat is not None and self.scheme.expiry in ("ttl", "ttlVacate"):
             for res_id, r in self._r.items():
@@ -774,6 +803,16 @@ class OccupancyArbiter(ReservationManager):
             # counted permits: their age is unknown across the restart, so each is counted afresh for T(1 + rho)
             r.live = {(h, int(e)): t for h, e in (d.get("live") or [])}
         self._log("RESTORED", "", "", None, None, reason=f"journal of boot {snap.get('boot')} taken up")
+        if (snap.get("guard") or "open") != "open":
+            # The journal was written while the zones were closed after a start that had lost its own journal: it
+            # holds no machine that may be inside, and the wait it records is cut short by this restart (its time is
+            # not known across it). The zones stay closed and both waits start again. (Found by a model in which
+            # each restart may keep or lose the journal, 2026-11-13: a second restart that found this journal
+            # opened the zones at once, with a machine of the first start still inside.)
+            self.guard = "waitTime" if self.scheme.leased else ("waitVacancy" if self.scheme.occ_aware else "open")
+            self._guard_since = t
+            self._log("GUARD_" + self.guard.upper(), "", "", None, None,
+                      reason=f"restart while the zones were closed ({snap.get('guard')}): occupancy unknown")
         # the zones as the earlier start had them: in this start's table from its first version on
         for z in zones_from_params({"conflict_zones": snap.get("zones") or []}):
             self.zones[z.resource_id] = z

@@ -37,3 +37,18 @@ def test_the_safe_schemes_survive_and_the_named_unsafe_ones_are_caught(env, jour
 def test_each_assumption_is_needed_by_the_protocol(ablate):
     res = fuzz(NAMED["cap"], runs=RUNS, steps=STEPS, env="site", journal="kept", ablate=ablate)
     assert not res["safe"], ablate
+
+
+def test_restarts_that_each_keep_or_lose_the_journal_keep_the_safe_schemes_safe():
+    """A restart may find the journal written during the wait after one that lost it. The journal records that the
+    zones are closed, and the restart waits again; the eight safe schemes stay safe."""
+    for key in [k for k in family() if expected_safe(k, "site", "mixed")]:
+        res = fuzz(key, runs=RUNS, steps=STEPS, env="site", journal="mixed")
+        assert res["safe"], (key, res)
+
+
+def test_without_the_closed_zones_in_the_journal_a_second_restart_reopens_them():
+    """The rule before 2026-11-13 - a restart that finds a journal opens the zones whatever it says - breaks the
+    protocol once restarts may keep or lose the journal (a model check with two restarts has the same counterexample)."""
+    res = fuzz(NAMED["cap"], runs=RUNS * 4, steps=STEPS, env="site", journal="mixed", ablate="guard")
+    assert not res["safe"], res

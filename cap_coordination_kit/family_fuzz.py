@@ -3,7 +3,9 @@
 The model checker enumerates the family of reservation schemes (cap-spec/formal/tla/family) over a small model. This
 module runs the same family on the arbiter's own code (``OccupancyArbiter``). An untrusted client issues requests,
 permit requests, releases and hand-overs at any time; links fail and recover; answers and notices are delayed or
-lost; clocks drift within rho; machines and the arbiter restart, the arbiter with its journal or without it; and the
+lost; clocks drift within rho; machines and the arbiter restart, the arbiter with its journal or without it (or,
+"mixed", either at each restart, so that a restart may find the journal written during the wait after one that lost
+it); and the
 Site observes every machine's true position (sound vacancy sensing, A2). The machines' entry gates follow their
 scheme: no check, a remembered grant, or a single-use permit timed from the moment its request was sent. After every
 step the oracle checks
@@ -30,8 +32,10 @@ A scheme is reported safe when no run violated S1-S3. Randomised runs find viola
 are none. What the module shows is that the arbiter's code, and not only the model, separates the safe schemes from
 the others, and in the same places.
 
-  python -m cap_coordination_kit.family_fuzz [--runs 200] [--steps 300] [--env site|own] [--journal kept|lost]
-      [--schemes all|named|safe|<arb-gate-release-expiry-succession>,...] [--ablate custody|drift|sensing]
+  python -m cap_coordination_kit.family_fuzz [--runs 200] [--steps 300] [--env site|own] [--journal kept|lost|mixed]
+      [--schemes all|named|safe|<arb-gate-release-expiry-succession>,...]
+      [--ablate custody|drift|sensing|guard]   (guard: a restart that finds a journal opens the zones, as before
+                                                2026-11-13; with --journal mixed it breaks the safe schemes)
       [--json out.json]
 """
 
@@ -91,7 +95,7 @@ def expected_safe(key: str, env: str, journal: str) -> bool:
         return False
     if g == "permit":
         return e in ("none", "ttlVacate")
-    return g == "local" and e == "none" and env == "own" and journal == "kept"
+    return g == "local" and e == "none" and env == "own" and journal == "kept"     # "mixed" loses it at times
 
 
 # ---------------------------------------------------------------------------- the world
@@ -252,10 +256,13 @@ class World:
             mc.permits.clear()
             mc.believes, mc.rid = None, None
         elif what == "arestart":
-            if self.journal_mode == "lost":
+            lose = self.journal_mode == "lost" or (self.journal_mode == "mixed" and rng.random() < 0.5)
+            if lose:
                 (self.dir / "occupancy_journal.jsonl").unlink(missing_ok=True)
             self.arb_offset = rng.uniform(0.0, 5000.0)
             self.arb = arb = self._new_arbiter()
+            if self.ablate == "guard" and not lose and arb.guard != "open":
+                arb.guard = "open"                           # the rule before 2026-11-13: the journal taken as it stood
             before = None                                    # a restarted arbiter sends no notice of the past
         self.trace.append(f"{step}:{what}:{m}")
         self._housekeeping(before)
@@ -377,10 +384,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs", type=int, default=200)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--env", choices=("site", "own"), default="site")
-    ap.add_argument("--journal", choices=("kept", "lost"), default="kept")
+    ap.add_argument("--journal", choices=("kept", "lost", "mixed"), default="kept")
     ap.add_argument("--schemes", default="all", help="all | named | safe (the model's safe ones) | comma-separated keys")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--ablate", choices=("", "custody", "drift", "sensing"), default="",
+    ap.add_argument("--ablate", choices=("", "custody", "drift", "sensing", "guard"), default="",
                     help="remove the custody rule's second half, let machine clocks drift beyond rho (A4), or let "
                          "the Site see a machine in the bay as far out (A2); the model has no safe scheme then")
     ap.add_argument("--json")
